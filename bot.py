@@ -1,257 +1,335 @@
 import datetime
-import random
-import os
 import json
+import logging
+import os
+import random
 import string
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from functools import wraps
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from json import JSONDecodeError
 
-TOKEN = os.getenv("BOT_TOKEN")
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
+
+
+TOKEN = os.environ.get("BOT_TOKEN")
 DATA_FILE = "users.json"
-SIGNAUX_DEFAUT = 3
-ADMIN_USERNAME = "hacker_ci"
 ADMIN_ID_FILE = "admin_id.json"
+SIGNAUX_DEFAUT = 3
+ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "hacker_ci").lstrip("@")
+COOLDOWN_SECONDS = 30
+
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+)
+logger = logging.getLogger(__name__)
+file_lock = threading.Lock()
+
+
+def lire_json(path, default):
+    with file_lock:
+        if not os.path.exists(path) or os.path.getsize(path) == 0:
+            return default.copy() if isinstance(default, dict) else default
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (JSONDecodeError, OSError) as exc:
+            logger.exception("Impossible de lire %s. Valeur par défaut utilisée.", path, exc_info=exc)
+            return default.copy() if isinstance(default, dict) else default
+
+
+def ecrire_json(path, data):
+    tmp_path = f"{path}.tmp"
+    with file_lock:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+
 
 def get_admin_id():
-    if os.path.exists(ADMIN_ID_FILE):
-        with open(ADMIN_ID_FILE, "r") as f:
-            return json.load(f).get("id")
-    return None
+    return lire_json(ADMIN_ID_FILE, {}).get("id")
+
 
 def sauvegarder_admin_id(user_id):
-    with open(ADMIN_ID_FILE, "w") as f:
-        json.dump({"id": user_id}, f)
+    ecrire_json(ADMIN_ID_FILE, {"id": user_id})
+
 
 def charger_users():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+    return lire_json(DATA_FILE, {})
+
 
 def sauvegarder_users(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    ecrire_json(DATA_FILE, data)
+
 
 def migrer_si_besoin(data):
     modifie = False
-    for uid, user in data.items():
+    for user in data.values():
         if "restants" not in user:
-            if user.get("vip"):
-                user["restants"] = 0
-            else:
-                user["restants"] = max(0, SIGNAUX_DEFAUT - user.get("signaux", 0))
+            user["restants"] = 0 if user.get("vip") else max(0, SIGNAUX_DEFAUT - user.get("signaux", 0))
+            modifie = True
+        if "vip" not in user:
+            user["vip"] = False
+            modifie = True
+        if "code" not in user:
+            user["code"] = generer_code_unique(data)
             modifie = True
     if modifie:
         sauvegarder_users(data)
     return data
 
+
 def peut_obtenir_signal(user):
-    return user["restants"] > 0
+    return user.get("restants", 0) > 0
+
 
 def generer_code_unique(data):
+    codes_existants = {user.get("code") for user in data.values()}
     while True:
         code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
-        codes_existants = [v.get("code") for v in data.values()]
         if code not in codes_existants:
             return code
 
+
 def get_ou_creer_user(user_id):
-    data = charger_users()
-    data = migrer_si_besoin(data)
+    data = migrer_si_besoin(charger_users())
     uid = str(user_id)
     if uid not in data:
-        code = generer_code_unique(data)
-        data[uid] = {"restants": SIGNAUX_DEFAUT, "vip": False, "code": code}
+        data[uid] = {"restants": SIGNAUX_DEFAUT, "vip": False, "code": generer_code_unique(data)}
         sauvegarder_users(data)
     return data, uid
+
 
 def sauvegarder_message_id(user_id, message_id):
     data = charger_users()
     uid = str(user_id)
     if uid in data:
-        if "messages" not in data[uid]:
-            data[uid]["messages"] = []
-        data[uid]["messages"].append(message_id)
+        data[uid].setdefault("messages", []).append(message_id)
         sauvegarder_users(data)
 
-# ===== MODIFIÉ ICI =====
+
 def consommer_signal(user_id):
     data = charger_users()
     uid = str(user_id)
-
-    # Même un VIP consomme un signal
-    data[uid]["restants"] = max(0, data[uid]["restants"] - 1)
-
+    if uid not in data:
+        return
+    data[uid]["restants"] = max(0, data[uid].get("restants", 0) - 1)
     data[uid]["dernier_signal"] = datetime.datetime.now().timestamp()
     sauvegarder_users(data)
+
 
 def get_secondes_restantes(user):
     dernier = user.get("dernier_signal")
     if not dernier:
         return 0
     ecoule = datetime.datetime.now().timestamp() - dernier
-    restant = 30 - ecoule
-    return max(0, int(restant))
+    return max(0, int(COOLDOWN_SECONDS - ecoule))
+
 
 def formater_date(ts):
     return datetime.datetime.fromtimestamp(ts).strftime("%d/%m/%Y")
 
+
 def generer_signal():
-    heureDate = datetime.datetime.now()
-    heureMinute = heureDate.minute
-    heureHour = heureDate.hour
+    heure_date = datetime.datetime.now()
+    heure_minute = heure_date.minute
+    heure_hour = heure_date.hour
+    heure_date = heure_date + datetime.timedelta(minutes=7)
 
-    minutesAvancees = 7
-    heureDate = heureDate + datetime.timedelta(minutes=minutesAvancees)
+    if 16 <= heure_hour < 17:
+        return "⏳ *Analyse en cours...*\n\nVeuillez réessayer dans une heure.", True
+    if 13 <= heure_minute < 14:
+        return "🔄 *Intervalle de jeu détecté.*\nPatientez quelques secondes.", True
 
-    if 16 <= heureHour < 17:
-        return ("⏳ *Analyse en cours...*\n\nVeuillez réessayer dans une heure.", True)
-    elif 13 <= heureMinute < 14:
-        return ("🔄 *Intervalle de jeu détecté.*\nPatientez quelques secondes.", True)
-    else:
-        hack = 7.00
-        max_val = 10.00
-        coefficientNumber = round(random.uniform(hack, max_val), 2)
-        halfNumber = round(coefficientNumber / 2, 2)
-        fiabibily = round(halfNumber / 2, 2)
+    coefficient_number = round(random.uniform(7.00, 10.00), 2)
+    half_number = round(coefficient_number / 2, 2)
+    reliability = round(half_number / 2, 2)
 
-        message = (
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🚀 *SIGNAL LUCKY JET* 💸\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
-            f"⏰ *Heure :*  `{heureDate.hour}:{heureDate.minute:02d}` — {heureDate.second:02d}s\n\n"
-            f"🎯 *Côte :*      `{coefficientNumber} X+`\n"
-            f"🛡 *Assurance :* `{halfNumber} X+`\n"
-            f"✅ *Fiable :*    `{fiabibily} X`\n\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"          🐉💰 *by hacker*"
-        )
-        return (message, True)
+    message = (
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🚀 *SIGNAL LUCKY JET* 💸\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"⏰ *Heure :*  `{heure_date.hour}:{heure_date.minute:02d}` — {heure_date.second:02d}s\n\n"
+        f"🎯 *Côte :*      `{coefficient_number} X+`\n"
+        f"🛡 *Assurance :* `{half_number} X+`\n"
+        f"✅ *Fiable :*    `{reliability} X`\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "          🐉💰 *by hacker*"
+    )
+    return message, True
+
 
 def bouton_signal(restants=None, vip=False):
-    if restants is not None:
-        label = f"🎰 Obtenir un signal ({restants})"
-    else:
-        label = "🎰 Obtenir un signal"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data="signal")],
-        [InlineKeyboardButton("🗑 Effacer", callback_data="effacer")]
-    ])
+    label = f"🎰 Obtenir un signal ({restants})" if restants is not None else "🎰 Obtenir un signal"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(label, callback_data="signal")],
+            [InlineKeyboardButton("🗑 Effacer", callback_data="effacer")],
+        ]
+    )
+
 
 def bouton_vip():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 Devenir VIP", callback_data="vip")],
-        [InlineKeyboardButton("🗑 Effacer", callback_data="effacer")]
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💎 Devenir VIP", callback_data="vip")],
+            [InlineKeyboardButton("🗑 Effacer", callback_data="effacer")],
+        ]
+    )
 
+
+def handler_securise(func):
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            return await func(update, context)
+        except Exception as exc:
+            logger.exception("Erreur dans %s", func.__name__, exc_info=exc)
+            try:
+                if update.callback_query:
+                    await update.callback_query.answer("Une erreur est survenue. Réessaie dans quelques secondes.", show_alert=True)
+                elif update.effective_message:
+                    await update.effective_message.reply_text("⚠️ Une erreur est survenue. Réessaie dans quelques secondes.")
+            except TelegramError:
+                logger.exception("Impossible d'envoyer le message d'erreur à l'utilisateur.")
+            return None
+
+    return wrapper
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Erreur Telegram non interceptée.", exc_info=context.error)
+
+
+def est_admin(update: Update):
+    username = update.effective_user.username if update.effective_user else None
+    return username == ADMIN_USERNAME
+
+
+async def refuser_non_admin(update: Update):
+    if update.effective_message:
+        await update.effective_message.reply_text("❌ Commande réservée à l'administrateur.")
+
+
+@handler_securise
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+    user_id = update.effective_user.id
     data, uid = get_ou_creer_user(user_id)
     user = data[uid]
-    vip = user["vip"]
-    restants = user["restants"]
-    code = user["code"]
+    vip = user.get("vip", False)
+    restants = user.get("restants", 0)
+    code = user.get("code", "?")
 
     if vip:
         vip_debut = user.get("vip_debut")
         vip_fin = user.get("vip_fin")
         if vip_debut and vip_fin:
-            jours_restants = (datetime.datetime.fromtimestamp(vip_fin) - datetime.datetime.now()).days
-            jours_restants = max(0, jours_restants)
+            jours_restants = max(0, (datetime.datetime.fromtimestamp(vip_fin) - datetime.datetime.now()).days)
             texte = (
-                f"👑 Bienvenue, membre VIP !\n"
+                "👑 Bienvenue, membre VIP !\n"
                 f"Ton code client : `{code}`\n\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
+                "━━━━━━━━━━━━━━━━━━\n"
                 f"📅 Abonnement depuis : *{formater_date(vip_debut)}*\n"
                 f"📆 Expire le : *{formater_date(vip_fin)}*\n"
                 f"⏳ Jours restants : *{jours_restants} jour{'s' if jours_restants > 1 else ''}*\n"
-                f"━━━━━━━━━━━━━━━━━━\n\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
                 f"Tu as *{restants}* signal{'s' if restants > 1 else ''} disponible{'s' if restants > 1 else ''}.\n"
-                f"Appuie sur le bouton pour obtenir un signal."
+                "Appuie sur le bouton pour obtenir un signal."
             )
         else:
             texte = (
-                f"👑 Bienvenue, membre VIP !\n"
+                "👑 Bienvenue, membre VIP !\n"
                 f"Ton code client : `{code}`\n\n"
                 f"Tu as *{restants}* signal{'s' if restants > 1 else ''} disponible{'s' if restants > 1 else ''}.\n"
-                f"Appuie sur le bouton pour obtenir un signal."
+                "Appuie sur le bouton pour obtenir un signal."
             )
         markup = bouton_signal(restants=restants, vip=vip)
     else:
         texte = (
-            f"👋 Bienvenue !\n"
+            "👋 Bienvenue !\n"
             f"Ton code client : `{code}`\n\n"
             f"Tu as *{restants}* signal{'s' if restants > 1 else ''} disponible{'s' if restants > 1 else ''}.\n"
-            f"Appuie sur le bouton pour obtenir un signal Lucky Jet."
+            "Appuie sur le bouton pour obtenir un signal Lucky Jet."
         )
         markup = bouton_signal(restants=restants)
 
-    msg = await update.message.reply_text(texte, reply_markup=markup, parse_mode="Markdown")
+    msg = await update.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
     sauvegarder_message_id(user_id, msg.message_id)
 
+
+@handler_securise
 async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+    user_id = update.effective_user.id
     data, uid = get_ou_creer_user(user_id)
     message_ids = data[uid].get("messages", [])
 
     supprime = 0
     for mid in message_ids:
         try:
-            await context.bot.delete_message(chat_id=update.message.chat_id, message_id=mid)
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=mid)
             supprime += 1
-        except Exception:
-            pass
+        except TelegramError:
+            logger.info("Message déjà supprimé ou inaccessible: %s", mid)
 
     data[uid]["messages"] = []
     sauvegarder_users(data)
 
     try:
         await update.message.delete()
-    except Exception:
-        pass
+    except TelegramError:
+        logger.info("Impossible de supprimer la commande /clean.")
 
     if supprime > 0:
         msg = await context.bot.send_message(
-            chat_id=update.message.chat_id,
-            text=f"🧹 {supprime} message{'s' if supprime > 1 else ''} supprimé{'s' if supprime > 1 else ''} !"
+            chat_id=update.effective_chat.id,
+            text=f"🧹 {supprime} message{'s' if supprime > 1 else ''} supprimé{'s' if supprime > 1 else ''} !",
         )
         sauvegarder_message_id(user_id, msg.message_id)
 
+
+@handler_securise
 async def mon_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
+    user_id = update.effective_user.id
     data, uid = get_ou_creer_user(user_id)
-    code = data[uid]["code"]
     await update.message.reply_text(
-        f"🔑 Ton code client est : `{code}`\n\nDonne ce code à l'admin pour recharger tes signaux.",
-        parse_mode="Markdown"
+        f"🔑 Ton code client est : `{data[uid]['code']}`\n\nDonne ce code à l'admin pour recharger tes signaux.",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
+
+@handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.from_user.username
-    if username != ADMIN_USERNAME:
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
+    if not est_admin(update):
+        await refuser_non_admin(update)
         return
 
-    sauvegarder_admin_id(update.message.from_user.id)
+    sauvegarder_admin_id(update.effective_user.id)
 
     if not context.args:
         await update.message.reply_text(
             "Usage : `/recharge CODE [nombre]`\nExemple : `/recharge ABC123` ou `/recharge ABC123 10`",
-            parse_mode="Markdown"
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
     code_cible = context.args[0].upper()
     nombre = int(context.args[1]) if len(context.args) > 1 and context.args[1].isdigit() else SIGNAUX_DEFAUT
-
-    data = charger_users()
-    data = migrer_si_besoin(data)
+    data = migrer_si_besoin(charger_users())
     uid_cible = next((uid for uid, u in data.items() if u.get("code") == code_cible), None)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     data[uid_cible]["restants"] = nombre
@@ -260,39 +338,38 @@ async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ Client `{code_cible}` rechargé avec *{nombre}* signal{'s' if nombre > 1 else ''}.\n"
         f"Signaux restants : *{nombre}*",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
         await context.bot.send_message(
             chat_id=int(uid_cible),
             text=(
-                f"🎉 Bonne nouvelle !\n\n"
-                f"Tes signaux ont été rechargés par l'admin.\n"
+                "🎉 Bonne nouvelle !\n\n"
+                "Tes signaux ont été rechargés par l'admin.\n"
                 f"Tu as maintenant *{nombre}* signal{'s' if nombre > 1 else ''} disponible{'s' if nombre > 1 else ''}.\n\n"
-                f"Appuie sur /start pour continuer ! 🚀"
+                "Appuie sur /start pour continuer ! 🚀"
             ),
-            parse_mode="Markdown"
+            parse_mode=ParseMode.MARKDOWN,
         )
-    except Exception:
-        pass
+    except TelegramError:
+        logger.exception("Impossible de notifier le client %s.", uid_cible)
 
+
+@handler_securise
 async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.from_user.username
-    if username != ADMIN_USERNAME:
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
+    if not est_admin(update):
+        await refuser_non_admin(update)
         return
 
-    sauvegarder_admin_id(update.message.from_user.id)
-
-    data = charger_users()
-    data = migrer_si_besoin(data)
+    sauvegarder_admin_id(update.effective_user.id)
+    data = migrer_si_besoin(charger_users())
     if not data:
         await update.message.reply_text("Aucun client enregistré.")
         return
 
     lignes = ["👥 *Liste des clients :*\n"]
-    for uid, user in data.items():
+    for user in data.values():
         code = user.get("code", "?")
         if user.get("vip"):
             vip_debut = user.get("vip_debut")
@@ -311,77 +388,70 @@ async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ligne = f"🆓 `{code}` — Gratuit — {restants} signal{'s' if restants > 1 else ''} restant{'s' if restants > 1 else ''}"
         lignes.append(ligne)
 
-    await update.message.reply_text("\n".join(lignes), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lignes), parse_mode=ParseMode.MARKDOWN)
 
+
+@handler_securise
 async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.from_user.username
-    if username != ADMIN_USERNAME:
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
+    if not est_admin(update):
+        await refuser_non_admin(update)
         return
 
-    sauvegarder_admin_id(update.message.from_user.id)
-
+    sauvegarder_admin_id(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage : `/vip CODE`\nEx: `/vip A3K9F2`", parse_mode="Markdown")
+        await update.message.reply_text("Usage : `/vip CODE`\nEx: `/vip A3K9F2`", parse_mode=ParseMode.MARKDOWN)
         return
 
     code_cible = context.args[0].upper()
-    data = charger_users()
-    data = migrer_si_besoin(data)
+    data = migrer_si_besoin(charger_users())
     uid_cible = next((uid for uid, u in data.items() if u.get("code") == code_cible), None)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     data[uid_cible]["vip"] = True
     sauvegarder_users(data)
-
     await update.message.reply_text(
-    f"✅ Client `{code_cible}` est maintenant VIP 👑\n"
-    f"Le client peut maintenant recevoir des recharges de signaux.",
-    parse_mode="Markdown"
-)
+        f"✅ Client `{code_cible}` est maintenant VIP 👑\nLe client peut maintenant recevoir des recharges de signaux.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
     try:
-    
         await context.bot.send_message(
-    chat_id=int(uid_cible),
-    text=(
-        "🎉 Félicitations !\n\n"
-        "👑 Votre compte VIP est maintenant activé.\n"
-        "L'administrateur va recharger vos signaux selon le pack acheté.\n\n"
-        "Tapez /start pour continuer. 🚀"
-    ),
-    parse_mode="Markdown"
-)
-    except Exception:
-        pass
+            chat_id=int(uid_cible),
+            text=(
+                "🎉 Félicitations !\n\n"
+                "👑 Votre compte VIP est maintenant activé.\n"
+                "L'administrateur va recharger vos signaux selon le pack acheté.\n\n"
+                "Tapez /start pour continuer. 🚀"
+            ),
+        )
+    except TelegramError:
+        logger.exception("Impossible de notifier le client %s.", uid_cible)
 
+
+@handler_securise
 async def abonnement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.from_user.username
-    if username != ADMIN_USERNAME:
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
+    if not est_admin(update):
+        await refuser_non_admin(update)
         return
 
-    sauvegarder_admin_id(update.message.from_user.id)
-
+    sauvegarder_admin_id(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage : `/abonnement CODE`\nEx: `/abonnement A3K9F2`", parse_mode="Markdown")
+        await update.message.reply_text("Usage : `/abonnement CODE`\nEx: `/abonnement A3K9F2`", parse_mode=ParseMode.MARKDOWN)
         return
 
     code_cible = context.args[0].upper()
-    data = charger_users()
-    data = migrer_si_besoin(data)
+    data = migrer_si_besoin(charger_users())
     uid_cible = next((uid for uid, u in data.items() if u.get("code") == code_cible), None)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     maintenant = datetime.datetime.now()
     fin = maintenant + datetime.timedelta(days=30)
-
     data[uid_cible]["vip"] = True
     data[uid_cible]["vip_debut"] = maintenant.timestamp()
     data[uid_cible]["vip_fin"] = fin.timestamp()
@@ -391,77 +461,71 @@ async def abonnement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Abonnement mensuel activé pour `{code_cible}` 👑\n\n"
         f"📅 Début : *{maintenant.strftime('%d/%m/%Y')}*\n"
         f"📆 Fin : *{fin.strftime('%d/%m/%Y')}*",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
         await context.bot.send_message(
             chat_id=int(uid_cible),
             text=(
-                f"🎉 Ton abonnement *VIP* est activé ! 👑\n\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
+                "🎉 Ton abonnement *VIP* est activé ! 👑\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
                 f"📅 Début : *{maintenant.strftime('%d/%m/%Y')}*\n"
                 f"📆 Expire le : *{fin.strftime('%d/%m/%Y')}*\n"
-                f"⏳ Durée : *30 jours*\n"
-                f"━━━━━━━━━━━━━━━━━━\n\n"
-                f"Tape /start pour voir ton abonnement. 🚀"
+                "⏳ Durée : *30 jours*\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "Tape /start pour voir ton abonnement. 🚀"
             ),
-            parse_mode="Markdown"
+            parse_mode=ParseMode.MARKDOWN,
         )
-    except Exception:
-        pass
+    except TelegramError:
+        logger.exception("Impossible de notifier le client %s.", uid_cible)
 
+
+@handler_securise
 async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Retire le statut VIP (sans abonnement mensuel)."""
-    username = update.message.from_user.username
-    if username != ADMIN_USERNAME:
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
+    if not est_admin(update):
+        await refuser_non_admin(update)
         return
 
-    sauvegarder_admin_id(update.message.from_user.id)
-
+    sauvegarder_admin_id(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage : `/devip CODE`\nEx: `/devip A3K9F2`", parse_mode="Markdown")
+        await update.message.reply_text("Usage : `/devip CODE`\nEx: `/devip A3K9F2`", parse_mode=ParseMode.MARKDOWN)
         return
 
     code_cible = context.args[0].upper()
-    data = charger_users()
-    data = migrer_si_besoin(data)
+    data = migrer_si_besoin(charger_users())
     uid_cible = next((uid for uid, u in data.items() if u.get("code") == code_cible), None)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     data[uid_cible]["vip"] = False
     sauvegarder_users(data)
     await update.message.reply_text(
-        f"✅ Statut VIP retiré au client `{code_cible}`.\n"
-        f"Il repasse en mode gratuit.",
-        parse_mode="Markdown"
+        f"✅ Statut VIP retiré au client `{code_cible}`.\nIl repasse en mode gratuit.",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    
 
+
+@handler_securise
 async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Coupe l'abonnement mensuel (12 000 FCFA/mois)."""
-    username = update.message.from_user.username
-    if username != ADMIN_USERNAME:
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
+    if not est_admin(update):
+        await refuser_non_admin(update)
         return
 
-    sauvegarder_admin_id(update.message.from_user.id)
-
+    sauvegarder_admin_id(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage : `/desabo CODE`\nEx: `/desabo A3K9F2`", parse_mode="Markdown")
+        await update.message.reply_text("Usage : `/desabo CODE`\nEx: `/desabo A3K9F2`", parse_mode=ParseMode.MARKDOWN)
         return
 
     code_cible = context.args[0].upper()
-    data = charger_users()
-    data = migrer_si_besoin(data)
+    data = migrer_si_besoin(charger_users())
     uid_cible = next((uid for uid, u in data.items() if u.get("code") == code_cible), None)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
         return
 
     data[uid_cible]["vip"] = False
@@ -469,66 +533,55 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data[uid_cible].pop("vip_fin", None)
     sauvegarder_users(data)
     await update.message.reply_text(
-        f"✅ Abonnement mensuel coupé pour `{code_cible}`.\n"
-        f"Il repasse en mode gratuit.",
-        parse_mode="Markdown"
+        f"✅ Abonnement mensuel coupé pour `{code_cible}`.\nIl repasse en mode gratuit.",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
     try:
         await context.bot.send_message(
             chat_id=int(uid_cible),
-            text=(
-                "⚠️ Ton abonnement mensuel VIP a été désactivé.\n\n"
-                "Pour renouveler, contacte l'admin : @hacker_ci 💬"
-            )
+            text="⚠️ Ton abonnement mensuel VIP a été désactivé.\n\nPour renouveler, contacte l'admin : @hacker_ci 💬",
         )
-    except Exception:
-        pass
+    except TelegramError:
+        logger.exception("Impossible de notifier le client %s.", uid_cible)
 
+
+@handler_securise
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.from_user.username
-    if username != ADMIN_USERNAME:
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
+    if not est_admin(update):
+        await refuser_non_admin(update)
         return
 
-    sauvegarder_admin_id(update.message.from_user.id)
-
-    data = charger_users()
-    data = migrer_si_besoin(data)
+    sauvegarder_admin_id(update.effective_user.id)
+    data = migrer_si_besoin(charger_users())
     total = len(data)
     vips = sum(1 for u in data.values() if u.get("vip"))
     gratuits = total - vips
 
-    # VIP qui expirent dans les 3 prochains jours
     bientot = []
     maintenant = datetime.datetime.now()
-    for uid, user in data.items():
+    for user in data.values():
         if user.get("vip") and user.get("vip_fin"):
             jours = (datetime.datetime.fromtimestamp(user["vip_fin"]) - maintenant).days
             if 0 <= jours <= 3:
                 bientot.append((user.get("code", "?"), jours))
 
-    texte = (
-        f"📊 Statistiques du bot :\n\n"
-        f"👥 Total clients : {total}\n"
-        f"👑 Membres VIP : {vips}\n"
-        f"🆓 Membres gratuits : {gratuits}"
-    )
+    texte = f"📊 Statistiques du bot :\n\n👥 Total clients : {total}\n👑 Membres VIP : {vips}\n🆓 Membres gratuits : {gratuits}"
     if bientot:
         texte += "\n\n⚠️ *Abonnements qui expirent bientôt :*"
-        for code, j in bientot:
-            texte += f"\n• `{code}` — expire dans {j} jour{'s' if j > 1 else ''}"
+        for code, jours in bientot:
+            texte += f"\n• `{code}` — expire dans {jours} jour{'s' if jours > 1 else ''}"
 
-    await update.message.reply_text(texte, parse_mode="Markdown")
+    await update.message.reply_text(texte, parse_mode=ParseMode.MARKDOWN)
 
+
+@handler_securise
 async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.message.from_user.username
-    if username != ADMIN_USERNAME:
-        await update.message.reply_text("❌ Commande réservée à l'administrateur.")
+    if not est_admin(update):
+        await refuser_non_admin(update)
         return
 
-    sauvegarder_admin_id(update.message.from_user.id)
-
+    sauvegarder_admin_id(update.effective_user.id)
     await update.message.reply_text(
         "🛠 Commandes admin disponibles :\n\n"
         "/clients — Liste tous les clients et leur statut\n"
@@ -541,22 +594,24 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/admin — Affiche ce menu"
     )
 
+
+@handler_securise
 async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     data, uid = get_ou_creer_user(user_id)
     user = data[uid]
-    vip = user["vip"]
-    restants = user["restants"]
+    vip = user.get("vip", False)
+    restants = user.get("restants", 0)
 
     attente = get_secondes_restantes(user)
     if attente > 0:
         await query.message.reply_text(
-            f"⏳ *Analyse en cours...*\n\n"
-            f"Le bot calcule la prochaine côte.\n"
+            "⏳ *Analyse en cours...*\n\n"
+            "Le bot calcule la prochaine côte.\n"
             f"Réessaie dans *{attente} seconde{'s' if attente > 1 else ''}*. 🔍",
-            parse_mode="Markdown"
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -573,18 +628,17 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             texte = f"{signal_txt}{statut_vip}\n\n⚠️ *Dernier signal utilisé !*\nRecharge tes signaux pour continuer."
             markup = bouton_vip()
 
-        msg = await query.message.reply_text(texte, reply_markup=markup, parse_mode="Markdown")
+        msg = await query.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
         sauvegarder_message_id(user_id, msg.message_id)
-
     else:
         msg = await query.message.reply_text(
-            "🔒 Tu n'as plus de signaux disponibles.\n\n"
-            "💎 Contacte l'admin pour recharger tes signaux.",
-            reply_markup=bouton_vip()
+            "🔒 Tu n'as plus de signaux disponibles.\n\n💎 Contacte l'admin pour recharger tes signaux.",
+            reply_markup=bouton_vip(),
         )
-
         sauvegarder_message_id(user_id, msg.message_id)
 
+
+@handler_securise
 async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -600,16 +654,18 @@ async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👉 Contacte l'admin : @hacker_ci"
     )
 
+
+@handler_securise
 async def effacer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
         await query.message.delete()
-    except Exception:
-        pass
+    except TelegramError:
+        logger.info("Message déjà supprimé ou inaccessible.")
 
-async def verifier_expirations(context):
-    """Job quotidien : vérifie les VIP expirés et notifie l'admin."""
+
+async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
     admin_id = get_admin_id()
     if not admin_id:
         return
@@ -618,43 +674,56 @@ async def verifier_expirations(context):
     maintenant = datetime.datetime.now()
     expires = []
 
-    for uid, user in data.items():
+    for user in data.values():
         if user.get("vip") and user.get("vip_fin"):
             fin = datetime.datetime.fromtimestamp(user["vip_fin"])
             jours_restants = (fin - maintenant).days
             if jours_restants < 0:
-                expires.append((uid, user.get("code", "?"), formater_date(user["vip_fin"])))
+                expires.append((user.get("code", "?"), formater_date(user["vip_fin"])))
 
-    for uid, code, date_fin in expires:
+    for code, date_fin in expires:
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
                 text=(
-                    f"⚠️ *Abonnement VIP expiré !*\n\n"
+                    "⚠️ *Abonnement VIP expiré !*\n\n"
                     f"🔑 Code client : `{code}`\n"
                     f"📆 Date d'expiration : *{date_fin}*\n\n"
                     f"👉 Utilise `/devip {code}` pour couper l'accès."
                 ),
-                parse_mode="Markdown"
+                parse_mode=ParseMode.MARKDOWN,
             )
-        except Exception:
-            pass
+        except TelegramError:
+            logger.exception("Impossible de notifier l'admin pour l'expiration %s.", code)
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Bot en ligne")
+
     def log_message(self, format, *args):
-        pass
+        return
+
 
 def lancer_serveur():
-    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info("Serveur de santé démarré sur le port %s.", port)
     server.serve_forever()
 
-if __name__ == "__main__":
-    threading.Thread(target=lancer_serveur, daemon=True).start()
-    app = ApplicationBuilder().token(TOKEN).build()
+
+async def supprimer_webhook(application: Application):
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Webhook supprimé. Démarrage du polling.")
+
+
+def creer_application():
+    if not TOKEN:
+        raise RuntimeError("La variable d'environnement BOT_TOKEN est obligatoire.")
+        
+    app = ApplicationBuilder().token(TOKEN).post_init(supprimer_webhook).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clean", clean))
     app.add_handler(CommandHandler("moncode", mon_code))
@@ -664,13 +733,33 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("vip", activer_vip_cmd))
     app.add_handler(CommandHandler("abonnement", abonnement_cmd))
     app.add_handler(CommandHandler("devip", desactiver_vip_cmd))
+    app.add_handler(CommandHandler("desabo", desabonner_cmd))
     app.add_handler(CommandHandler("admin", admin_help))
     app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
     app.add_handler(CallbackQueryHandler(vip_callback, pattern="^vip$"))
     app.add_handler(CallbackQueryHandler(effacer_callback, pattern="^effacer$"))
+    app.add_error_handler(error_handler)
 
-    # Vérification quotidienne des abonnements expirés (toutes les 24h)
-    app.job_queue.run_repeating(verifier_expirations, interval=86400, first=60)
+    if app.job_queue:
+        app.job_queue.run_repeating(verifier_expirations, interval=86400, first=60)
+    else:
+        logger.warning("Job queue indisponible. Vérifie python-telegram-bot[job-queue] dans requirements.txt.")
 
-    print("Bot démarré...")
-    app.run_polling()
+    return app
+
+
+def main():
+    threading.Thread(target=lancer_serveur, daemon=True).start()
+    app = creer_application()
+    logger.info("Bot démarré.")
+    app.run_polling(
+        poll_interval=1.0,
+        timeout=30,
+        bootstrap_retries=-1,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
+
+
+if __name__ == "__main__":
+    main()
