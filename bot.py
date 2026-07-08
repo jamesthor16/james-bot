@@ -73,20 +73,30 @@ def sauvegarder_users(data):
     ecrire_json(DATA_FILE, data)
 
 
+# ===== MODIFIÉ =====
 def migrer_si_besoin(data):
     modifie = False
+
     for user in data.values():
         if "restants" not in user:
-            user["restants"] = 0 if user.get("vip") else max(0, SIGNAUX_DEFAUT - user.get("signaux", 0))
+            user["restants"] = 0
             modifie = True
+
         if "vip" not in user:
             user["vip"] = False
             modifie = True
+
         if "code" not in user:
             user["code"] = generer_code_unique(data)
             modifie = True
+
+        if "gratuits_deja_donnes" not in user:
+            user["gratuits_deja_donnes"] = True
+            modifie = True
+
     if modifie:
         sauvegarder_users(data)
+
     return data
 
 
@@ -102,12 +112,20 @@ def generer_code_unique(data):
             return code
 
 
+# ===== MODIFIÉ =====
 def get_ou_creer_user(user_id):
     data = migrer_si_besoin(charger_users())
     uid = str(user_id)
+
     if uid not in data:
-        data[uid] = {"restants": SIGNAUX_DEFAUT, "vip": False, "code": generer_code_unique(data)}
+        data[uid] = {
+            "restants": SIGNAUX_DEFAUT,
+            "vip": False,
+            "code": generer_code_unique(data),
+            "gratuits_deja_donnes": True,
+        }
         sauvegarder_users(data)
+
     return data, uid
 
 
@@ -595,6 +613,7 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ===== MODIFIÉ =====
 @handler_securise
 async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -622,7 +641,12 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         statut_vip = "\n\n👑 Statut : VIP" if vip else ""
 
         if restants > 0:
-            texte = f"{signal_txt}{statut_vip}\n\n⚡ Il te reste *{restants}* signal{'s' if restants > 1 else ''} gratuit{'s' if restants > 1 else ''}."
+            if vip:
+                texte_restants = f"👑 Il te reste *{restants}* signaux VIP."
+            else:
+                texte_restants = f"⚡ Il te reste *{restants}* signaux gratuits."
+
+            texte = f"{signal_txt}{statut_vip}\n\n{texte_restants}"
             markup = bouton_signal(restants=restants, vip=vip)
         else:
             texte = f"{signal_txt}{statut_vip}\n\n⚠️ *Dernier signal utilisé !*\nRecharge tes signaux pour continuer."
@@ -636,7 +660,6 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=bouton_vip(),
         )
         sauvegarder_message_id(user_id, msg.message_id)
-
 
 @handler_securise
 async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -722,7 +745,7 @@ async def supprimer_webhook(application: Application):
 def creer_application():
     if not TOKEN:
         raise RuntimeError("La variable d'environnement BOT_TOKEN est obligatoire.")
-        
+    
     app = ApplicationBuilder().token(TOKEN).post_init(supprimer_webhook).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clean", clean))
