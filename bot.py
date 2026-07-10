@@ -73,6 +73,27 @@ def sauvegarder_users(data):
     ecrire_json(DATA_FILE, data)
 
 
+def normaliser_signaux_restants(user):
+    try:
+        restants = int(user.get("restants", 0))
+    except (TypeError, ValueError):
+        restants = 0
+
+    restants = max(0, restants)
+    user["restants"] = restants
+    return restants
+
+
+def remettre_en_mode_gratuit(user):
+    user["vip"] = False
+    user["restants"] = SIGNAUX_DEFAUT
+    user["gratuits_deja_donnes"] = True
+    user["vip_signals"] = 0
+    user.pop("vip_debut", None)
+    user.pop("vip_fin", None)
+    user.pop("dernier_signal", None)
+
+
 # ===== MODIFIÉ =====
 def migrer_si_besoin(data):
     modifie = False
@@ -94,6 +115,11 @@ def migrer_si_besoin(data):
             user["gratuits_deja_donnes"] = True
             modifie = True
 
+        restants_avant = user.get("restants", 0)
+        normaliser_signaux_restants(user)
+        if user["restants"] != restants_avant:
+            modifie = True
+
     if modifie:
         sauvegarder_users(data)
 
@@ -101,7 +127,7 @@ def migrer_si_besoin(data):
 
 
 def peut_obtenir_signal(user):
-    return user.get("restants", 0) > 0
+    return normaliser_signaux_restants(user) > 0
 
 
 def generer_code_unique(data):
@@ -141,10 +167,23 @@ def consommer_signal(user_id):
     data = charger_users()
     uid = str(user_id)
     if uid not in data:
-        return
-    data[uid]["restants"] = max(0, data[uid].get("restants", 0) - 1)
+        return 0
+
+    restants = normaliser_signaux_restants(data[uid])
+    if restants <= 0:
+        sauvegarder_users(data)
+        return 0
+
+    data[uid]["restants"] = restants - 1
+    if data[uid].get("vip"):
+        try:
+            vip_signals = int(data[uid].get("vip_signals", restants))
+        except (TypeError, ValueError):
+            vip_signals = restants
+        data[uid]["vip_signals"] = max(0, vip_signals - 1)
     data[uid]["dernier_signal"] = datetime.datetime.now().timestamp()
     sauvegarder_users(data)
+    return data[uid]["restants"]
 
 
 def get_secondes_restantes(user):
@@ -166,9 +205,9 @@ def generer_signal():
     heure_date = heure_date + datetime.timedelta(minutes=7)
 
     if 16 <= heure_hour < 17:
-        return "⏳ *Analyse en cours...*\n\nVeuillez réessayer dans une heure.", True
+        return "⏳ *Analyse en cours...*\n\nVeuillez réessayer dans une heure.", False
     if 13 <= heure_minute < 14:
-        return "🔄 *Intervalle de jeu détecté.*\nPatientez quelques secondes.", True
+        return "🔄 *Intervalle de jeu détecté.*\nPatientez quelques secondes.", False
 
     coefficient_number = round(random.uniform(7.00, 10.00), 2)
     half_number = round(coefficient_number / 2, 2)
@@ -350,7 +389,16 @@ async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
         return
 
+    if not data[uid_cible].get("vip", False):
+        await update.message.reply_text(
+            "❌ Ce client n'est pas VIP.\n\n"
+            "Activez d'abord le VIP avec :\n\n"
+            "/vip CODE"
+        )
+        return
+
     data[uid_cible]["restants"] = nombre
+    data[uid_cible]["vip_signals"] = nombre
     sauvegarder_users(data)
 
     await update.message.reply_text(
@@ -519,10 +567,10 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    data[uid_cible]["vip"] = False
+    remettre_en_mode_gratuit(data[uid_cible])
     sauvegarder_users(data)
     await update.message.reply_text(
-        f"✅ Statut VIP retiré au client `{code_cible}`.\nIl repasse en mode gratuit.",
+        f"✅ Statut VIP retiré au client `{code_cible}`.\nIl repasse en mode gratuit avec {SIGNAUX_DEFAUT} signaux gratuits.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -546,9 +594,7 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
         return
 
-    data[uid_cible]["vip"] = False
-    data[uid_cible].pop("vip_debut", None)
-    data[uid_cible].pop("vip_fin", None)
+    remettre_en_mode_gratuit(data[uid_cible])
     sauvegarder_users(data)
     await update.message.reply_text(
         f"✅ Abonnement mensuel coupé pour `{code_cible}`.\nIl repasse en mode gratuit.",
@@ -634,32 +680,51 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if peut_obtenir_signal(user):
-        consommer_signal(user_id)
-        restants -= 1
-        signal_txt, _ = generer_signal()
-        statut_vip = "\n\n👑 Statut : VIP" if vip else ""
-
-        if restants > 0:
-            if vip:
-                texte_restants = f"👑 Il te reste *{restants}* signaux VIP."
-            else:
-                texte_restants = f"⚡ Il te reste *{restants}* signaux gratuits."
-
-            texte = f"{signal_txt}{statut_vip}\n\n{texte_restants}"
-            markup = bouton_signal(restants=restants, vip=vip)
-        else:
-            texte = f"{signal_txt}{statut_vip}\n\n⚠️ *Dernier signal utilisé !*\nRecharge tes signaux pour continuer."
-            markup = bouton_vip()
-
-        msg = await query.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
-        sauvegarder_message_id(user_id, msg.message_id)
-    else:
+    if not peut_obtenir_signal(user):
         msg = await query.message.reply_text(
             "🔒 Tu n'as plus de signaux disponibles.\n\n💎 Contacte l'admin pour recharger tes signaux.",
             reply_markup=bouton_vip(),
         )
         sauvegarder_message_id(user_id, msg.message_id)
+        return
+
+    signal_txt, signal_genere = generer_signal()
+    if not signal_txt:
+        msg = await query.message.reply_text(
+            "⚠️ Impossible de générer une prédiction pour le moment.\n\nRéessaie dans quelques instants.",
+            reply_markup=bouton_signal(restants=restants, vip=vip),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        sauvegarder_message_id(user_id, msg.message_id)
+        return
+
+    if not signal_genere:
+        msg = await query.message.reply_text(
+            signal_txt,
+            reply_markup=bouton_signal(restants=restants, vip=vip),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        sauvegarder_message_id(user_id, msg.message_id)
+        return
+
+    restants_apres = max(0, restants - 1)
+    statut_vip = "\n\n👑 Statut : VIP" if vip else ""
+
+    if restants_apres > 0:
+        if vip:
+            texte_restants = f"👑 Il te reste *{restants_apres}* signaux VIP."
+        else:
+            texte_restants = f"⚡ Il te reste *{restants_apres}* signaux gratuits."
+
+        texte = f"{signal_txt}{statut_vip}\n\n{texte_restants}"
+        markup = bouton_signal(restants=restants_apres, vip=vip)
+    else:
+        texte = f"{signal_txt}{statut_vip}\n\n⚠️ *Dernier signal utilisé !*\nRecharge tes signaux pour continuer."
+        markup = bouton_vip()
+
+    msg = await query.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    consommer_signal(user_id)
+    sauvegarder_message_id(user_id, msg.message_id)
 
 @handler_securise
 async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
