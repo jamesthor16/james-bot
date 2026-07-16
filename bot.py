@@ -1,9 +1,11 @@
 import datetime
 import asyncio
+import html
 import json
 import logging
 import os
 import random
+import re
 import string
 import threading
 from functools import wraps
@@ -22,7 +24,7 @@ from telegram.ext import (
 )
 
 
-TOKEN = os.environ.get("BOT_TOKEN")
+TOKEN = "8886184186:AAFYXUJ9ahtYq_V-gRU8GQj6wKrSnfJdKf4"
 DATA_FILE = "users.json"
 ADMIN_ID_FILE = "admin_id.json"
 SIGNAUX_DEFAUT = 3
@@ -31,7 +33,16 @@ COOLDOWN_SECONDS = 30
 ANALYSE_MIN_SECONDS = 8
 ANALYSE_MAX_SECONDS = 15
 HISTORIQUE_LIMIT = 100
-OPPORTUNITE_MIN_SCORE = 0.22
+OPPORTUNITE_REFUS_PROBABILITY = 0.12
+
+
+def admin_username_html():
+    return f"@{html.escape(ADMIN_USERNAME)}"
+
+
+def echapper_html_texte(texte):
+    """Échappe les caractères HTML spéciaux pour une utilisation sûre en ParseMode.HTML"""
+    return html.escape(str(texte), quote=True)
 
 
 logging.basicConfig(
@@ -40,20 +51,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 file_lock = threading.RLock()
+json_cache = {}
 analyses_lock = threading.Lock()
 analyses_en_cours = set()
 
 
 def lire_json(path, default):
     with file_lock:
+        if path in json_cache:
+            return json_cache[path]
         if not os.path.exists(path) or os.path.getsize(path) == 0:
-            return default.copy() if isinstance(default, dict) else default
+            valeur = default.copy() if isinstance(default, dict) else default
+            json_cache[path] = valeur
+            return valeur
         try:
             with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                valeur = json.load(f)
+                json_cache[path] = valeur
+                return valeur
         except (JSONDecodeError, OSError) as exc:
             logger.exception("Impossible de lire %s. Valeur par défaut utilisée.", path, exc_info=exc)
-            return default.copy() if isinstance(default, dict) else default
+            valeur = default.copy() if isinstance(default, dict) else default
+            json_cache[path] = valeur
+            return valeur
 
 
 def ecrire_json(path, data):
@@ -61,6 +81,7 @@ def ecrire_json(path, data):
     os.makedirs(dossier, exist_ok=True)
     tmp_path = os.path.join(dossier, f".{os.path.basename(path)}.{os.getpid()}.tmp")
     with file_lock:
+        json_cache[path] = data
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.flush()
@@ -157,6 +178,7 @@ def normaliser_signaux_restants(user):
     if abonnement_actif(user):
         user["vip"] = True
         user["illimite"] = True
+        user["restants"] = None
         return vip_signals
 
     user["illimite"] = False
@@ -239,7 +261,6 @@ def generer_code_unique(data):
             return code
 
 
-# ===== MODIFIÉ =====
 def trouver_uid_par_code(data, code_cible):
     return next(
         (
@@ -356,14 +377,32 @@ def niveau_depuis_coefficient(coefficient):
 
 def texte_compteur_compte(user):
     if abonnement_actif(user):
-        return "👑 *Abonnement VIP actif*\n♾️ Signaux illimités"
+        return (
+            "━━━━━━━━━━━━━━\n"
+            "👑 <b>Compte Premium</b>\n\n"
+            "🎟 Signaux restants\n"
+            "♾️ Illimité\n"
+            "━━━━━━━━━━━━━━"
+        )
 
     restants = normaliser_signaux_restants(user)
     if user.get("vip"):
-        return f"👑 Il vous reste *{restants}* signaux VIP."
+        return (
+            "━━━━━━━━━━━━━━\n"
+            "👑 <b>Compte Premium</b>\n\n"
+            "🎟 Signaux restants\n"
+            f"<b>{restants}</b>\n"
+            "━━━━━━━━━━━━━━"
+        )
 
     if restants > 0:
-        return f"⚡ Il vous reste *{restants}* signaux gratuits."
+        return (
+            "━━━━━━━━━━━━━━\n"
+            "🆓 <b>Compte gratuit</b>\n\n"
+            "🎟 Signaux restants\n"
+            f"<b>{restants}</b>\n"
+            "━━━━━━━━━━━━━━"
+        )
 
     return (
         "❌ Vous avez épuisé vos signaux gratuits.\n\n"
@@ -381,7 +420,7 @@ def texte_expiration(user):
 
     return (
         "❌ Votre abonnement VIP a expiré.\n\n"
-        f"⚡ Il vous reste *{normaliser_signaux_gratuits(user)}* signaux gratuits."
+        f"⚡ Il vous reste <b>{normaliser_signaux_gratuits(user)}</b> signaux gratuits."
     )
 
 
@@ -397,10 +436,21 @@ def ajouter_historique_signal(user, signal_txt, statut):
     user["historique_signaux"] = historique[-HISTORIQUE_LIMIT:]
 
 
+def derniers_multiplicateurs(user, limite=8):
+    valeurs = set()
+    for entree in user.get("historique_signaux", [])[-limite:]:
+        signal = entree.get("signal", "")
+        match = re.search(r"Multiplicateur\*\n`([0-9]+(?:\.[0-9]+)?)x`", signal)
+        if match:
+            valeurs.add(match.group(1))
+    return valeurs
+
+
 def opportunite_marche_disponible(user):
     historique = user.get("historique_signaux", [])
-    dernieres_minutes = 0
     maintenant = datetime.datetime.now()
+    refus_probability = OPPORTUNITE_REFUS_PROBABILITY
+    dernieres_minutes = 0
 
     for entree in historique[-10:]:
         try:
@@ -410,13 +460,12 @@ def opportunite_marche_disponible(user):
         if (maintenant - date_signal).total_seconds() <= 180:
             dernieres_minutes += 1
 
-    score = random.random()
-    if dernieres_minutes >= 2:
-        score -= 0.18
+    if dernieres_minutes >= 3:
+        refus_probability += 0.03
     if maintenant.minute in {0, 1, 29, 30, 31, 58, 59}:
-        score -= 0.08
+        refus_probability += 0.02
 
-    return score >= OPPORTUNITE_MIN_SCORE
+    return random.random() >= min(refus_probability, 0.15)
 
 
 def barre_progression(pourcentage):
@@ -426,18 +475,20 @@ def barre_progression(pourcentage):
 
 def texte_analyse(etape, pourcentage):
     titres = [
-        "🔍 Vérification des données...",
-        "📊 Analyse des tendances...",
-        "🧠 Vérification des probabilités...",
-        "⚙️ Validation finale...",
+        "🔍 Connexion...",
+        "📊 Analyse...",
+        "🧠 Vérification...",
+        "⚙️ Validation...",
         "✅ Analyse terminée.",
     ]
+    points = "●" * (etape + 1) + "○" * (4 - etape)
     return (
         "━━━━━━━━━━━━━━━━━━\n"
-        "🎰 *ANALYSE LUCKY JET*\n"
+        "🎰 <b>ANALYSE LUCKY JET</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
         f"{titres[etape]}\n\n"
-        f"`{barre_progression(pourcentage)}`"
+        f"<code>{points}</code>\n\n"
+        f"<code>{barre_progression(pourcentage)}</code>"
     )
 
 
@@ -451,7 +502,7 @@ async def lancer_animation_analyse(query, user_id):
 
     message = await query.message.reply_text(
         texte_analyse(0, etapes[0]),
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
     )
     sauvegarder_message_id(user_id, message.message_id)
 
@@ -460,7 +511,7 @@ async def lancer_animation_analyse(query, user_id):
         try:
             await message.edit_text(
                 texte_analyse(index, etapes[index]),
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
             )
         except TelegramError:
             logger.info("Impossible de mettre à jour l'animation d'analyse.")
@@ -468,44 +519,63 @@ async def lancer_animation_analyse(query, user_id):
     return message
 
 
-def generer_signal():
+def delai_signal_depuis_coefficient(coefficient):
+    if coefficient >= 9.5:
+        return random.randint(1, 2)
+    if coefficient >= 9:
+        return random.randint(2, 3)
+    if coefficient >= 8:
+        return random.randint(4, 5)
+    return random.randint(6, 7)
+
+
+def generer_signal(user=None):
     heure_date = datetime.datetime.now()
     heure_minute = heure_date.minute
     heure_hour = heure_date.hour
-    heure_date = heure_date + datetime.timedelta(minutes=7)
 
     if 16 <= heure_hour < 17:
-        return "⏳ *Analyse en cours...*\n\nVeuillez réessayer dans une heure.", False
+        return "⏳ <b>Analyse en cours...</b>\n\nVeuillez réessayer dans une heure.", False
     if 13 <= heure_minute < 14:
-        return "🔄 *Intervalle de jeu détecté.*\nPatientez quelques secondes.", False
+        return "🔄 <b>Intervalle de jeu détecté.</b>\nVeuillez réessayer dans une heure.", False
 
+    deja_vus = derniers_multiplicateurs(user or {})
     coefficient_number = round(random.uniform(7.00, 10.00), 2)
+    for _ in range(12):
+        if f"{coefficient_number}" not in deja_vus:
+            break
+        coefficient_number = round(random.uniform(7.00, 10.00), 2)
+
     half_number = round(coefficient_number / 2, 2)
-    reliability = round(half_number / 2, 2)
+    reliability = random.uniform(1.50, 2.50)
+    heure_date = heure_date + datetime.timedelta(minutes=delai_signal_depuis_coefficient(coefficient_number))
     niveau = niveau_depuis_coefficient(coefficient_number)
 
     message = (
         "━━━━━━━━━━━━━━━━━━\n"
-        "🚀 *LUCKY JET SIGNAL*\n"
+        "🚀 <b>LUCKY JET SIGNAL</b>\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "🎯 *Multiplicateur*\n"
-        f"`{coefficient_number}x`\n\n"
-        "🛡 *Assurance*\n"
-        f"`{half_number}x`\n\n"
-        "📊 *Niveau*\n"
-        f"`{niveau}`\n\n"
-        "✅ *Indice fiable*\n"
-        f"`{reliability}x`\n\n"
-        "🕒 *Heure*\n"
-        f"`{formater_heure_signal(heure_date)}`\n\n"
+        "🎯 <b>Multiplicateur</b>\n"
+        f"<code>{coefficient_number}x</code>\n\n"
+        "🛡 <b>Assurance</b>\n"
+        f"<code>{half_number}x</code>\n\n"
+        "📊 <b>Niveau</b>\n"
+        f"<code>{niveau}</code>\n\n"
+        "✅ <b>Indice fiable</b>\n"
+        f"<code>{reliability:.2f}x</code>\n\n"
+        "🕒 <b>Heure</b>\n"
+        f"<code>{formater_heure_signal(heure_date)}</code>\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "✅ *Analyse terminée*\n"
+        "✅ <b>Analyse terminée</b>\n"
         "━━━━━━━━━━━━━━━━━━"
     )
     return message, True
 
 
+# ===== MENUS RESTRUCTURÉS =====
+
 def bouton_signal(restants=None, vip=False, illimite=False):
+    """Menu principal - 3 boutons seulement (compact et professionnel)"""
     if illimite:
         label = "🎰 Obtenir un signal (∞)"
     elif restants is not None:
@@ -516,17 +586,62 @@ def bouton_signal(restants=None, vip=False, illimite=False):
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(label, callback_data="signal")],
-            [InlineKeyboardButton("🗑 Effacer", callback_data="effacer")],
+            [InlineKeyboardButton("👑 Mon compte", callback_data="compte_menu")],
+            [InlineKeyboardButton("💎 VIP & Support", callback_data="vip_menu")],
+        ]
+    )
+
+
+def bouton_compte():
+    """Sous-menu : Mon compte (3 options + retour)"""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 Mes signaux", callback_data="historique")],
+            [InlineKeyboardButton("📅 Mon abonnement", callback_data="abonnement")],
+            [InlineKeyboardButton("ℹ️ Mon code", callback_data="code")],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="retour")],
+        ]
+    )
+
+
+def bouton_vip_menu():
+    """Sous-menu : VIP & Support (2 options + retour)"""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🛒 Acheter un pack", callback_data="vip")],
+            [InlineKeyboardButton("📞 Support", callback_data="support")],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="retour")],
         ]
     )
 
 
 def bouton_vip():
+    """Fallback : Quand l'utilisateur n'a pas de signaux"""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("💎 Devenir VIP", callback_data="vip")],
-            [InlineKeyboardButton("🗑 Effacer", callback_data="effacer")],
+            [InlineKeyboardButton("💎 Acheter un pack", callback_data="vip")],
+            [InlineKeyboardButton("📞 Support", callback_data="support")],
+            [InlineKeyboardButton("ℹ️ Mon code", callback_data="code")],
         ]
+    )
+
+
+# ===== FONCTION POUR REMPLACER LES MESSAGES =====
+
+async def remplacer_message(query, texte, markup=None):
+    """
+    Supprime le message actuel et envoie un nouveau message à sa place.
+    Rend le bot très professionnel sans clutter.
+    """
+    try:
+        await query.message.delete()
+    except TelegramError:
+        logger.info("Impossible de supprimer le message précédent.")
+    
+    return await query.message.chat.send_message(
+        text=texte,
+        reply_markup=markup,
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -539,7 +654,7 @@ def handler_securise(func):
             logger.exception("Erreur dans %s", func.__name__, exc_info=exc)
             try:
                 if update.callback_query:
-                    await update.callback_query.answer("Une erreur est survenue. Réessaie dans quelques secondes.", show_alert=True)
+                    await update.callback_query.answer("Une erreur est survenue. Réessaie dans quelques secondes.", show_alert=False)
                 elif update.effective_message:
                     await update.effective_message.reply_text("⚠️ Une erreur est survenue. Réessaie dans quelques secondes.")
             except TelegramError:
@@ -560,7 +675,7 @@ def est_admin(update: Update):
 
 async def refuser_non_admin(update: Update):
     if update.effective_message:
-        await update.effective_message.reply_text("❌ Commande réservée à l'administrateur.")
+        await update.effective_message.reply_text("❌ Commande réservée à l'administrateur.", parse_mode=ParseMode.HTML)
 
 
 @handler_securise
@@ -579,7 +694,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     illimite = abonnement_actif(user)
 
     if expire:
-        texte = f"{texte_expiration(user)}\n\n🔑 Code client : `{code}`"
+        texte = f"{texte_expiration(user)}\n\n🔑 Code client : <code>{echapper_html_texte(code)}</code>"
         markup = bouton_vip() if restants <= 0 else bouton_signal(restants=restants)
     elif illimite:
         vip_debut = user.get("vip_debut")
@@ -587,12 +702,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         jours_restants = jours_restants_jusqua(vip_fin)
         texte = (
             "━━━━━━━━━━━━━━━━━━\n"
-            "👑 *ESPACE VIP PREMIUM*\n"
+            "👑 <b>ESPACE VIP PREMIUM</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"🔑 Code client : `{code}`\n\n"
-            f"📅 Début : *{formater_date(vip_debut)}*\n"
-            f"📆 Expire le : *{formater_date(vip_fin)}*\n"
-            f"⏳ Jours restants : *{jours_restants} jour{'s' if jours_restants > 1 else ''}*\n\n"
+            f"🔑 Code client : <code>{echapper_html_texte(code)}</code>\n\n"
+            f"📅 Début : <b>{echapper_html_texte(formater_date(vip_debut))}</b>\n"
+            f"📆 Expire le : <b>{echapper_html_texte(formater_date(vip_fin))}</b>\n"
+            f"⏳ Jours restants : <b>{jours_restants} jour{'s' if jours_restants > 1 else ''}</b>\n\n"
             f"{texte_compteur_compte(user)}\n\n"
             "🎰 Lance une analyse pour obtenir le prochain signal."
         )
@@ -600,15 +715,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         texte = (
             "━━━━━━━━━━━━━━━━━━\n"
-            "🎰 *LUCKY JET PREMIUM*\n"
+            "🎰 <b>LUCKY JET PREMIUM</b>\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"🔑 Code client : `{code}`\n\n"
+            f"🔑 Code client : <code>{echapper_html_texte(code)}</code>\n\n"
             f"{texte_compteur_compte(user)}\n\n"
             "🎯 Appuie sur le bouton pour lancer une analyse."
         )
         markup = bouton_signal(restants=restants, vip=vip) if restants > 0 else bouton_vip()
 
-    msg = await update.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+    msg = await update.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.HTML)
     sauvegarder_message_id(user_id, msg.message_id)
 
 
@@ -638,6 +753,7 @@ async def clean(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=f"🧹 {supprime} message{'s' if supprime > 1 else ''} supprimé{'s' if supprime > 1 else ''} !",
+            parse_mode=ParseMode.HTML,
         )
         sauvegarder_message_id(user_id, msg.message_id)
 
@@ -647,8 +763,8 @@ async def mon_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data, uid = get_ou_creer_user(user_id)
     await update.message.reply_text(
-        f"🔑 Ton code client est : `{data[uid]['code']}`\n\nDonne ce code à l'admin pour recharger tes signaux.",
-        parse_mode=ParseMode.MARKDOWN,
+        f"🔑 Ton code client est : <code>{echapper_html_texte(data[uid]['code'])}</code>\n\nDonne ce code à l'admin pour recharger tes signaux.",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -662,49 +778,63 @@ async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(context.args) < 2 or not context.args[1].isdigit():
         await update.message.reply_text(
-            "Usage : `/recharge CODE NOMBRE`\nExemple : `/recharge ABC123 250`",
-            parse_mode=ParseMode.MARKDOWN,
+            "Usage : <code>/recharge CODE NOMBRE</code>\nExemple : <code>/recharge ABC123 250</code>",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     code_cible = context.args[0].upper()
     nombre = int(context.args[1])
     if nombre <= 0 or nombre > 100000:
-        await update.message.reply_text("❌ Nombre de signaux invalide.")
+        await update.message.reply_text("❌ Nombre de signaux invalide.", parse_mode=ParseMode.HTML)
         return
 
     data = migrer_si_besoin(charger_users())
     uid_cible = trouver_uid_par_code(data, code_cible)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
-        return
-
-    if not data[uid_cible].get("vip", False):
-        await update.message.reply_text(
-            "❌ Ce client n'est pas VIP.\n\n"
-            "Activez d'abord le VIP avec :\n\n"
-            "/vip CODE"
-        )
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
     user_cible = data[uid_cible]
+    if appliquer_expiration_si_necessaire(user_cible):
+        sauvegarder_users(data)
+        await update.message.reply_text(
+            "⚠️ L'abonnement de ce client était expiré et vient d'être retiré automatiquement.\n\n"
+            "Activez d'abord le VIP classique avec :\n\n"
+            "<code>/vip CODE</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if not user_cible.get("vip", False):
+        await update.message.reply_text(
+            "❌ Ce client n'est pas VIP.\n\n"
+            "Activez d'abord le VIP avec :\n\n"
+            "<code>/vip CODE</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     if abonnement_actif(user_cible):
         await update.message.reply_text(
             "ℹ️ Ce client possède déjà un abonnement VIP illimité actif.\n\n"
-            "La commande /recharge est réservée aux packs VIP classiques."
+            "La commande /recharge est réservée aux packs VIP classiques.",
+            parse_mode=ParseMode.HTML,
         )
         return
 
     user_cible["restants"] = nombre
     user_cible["vip_signals"] = nombre
     user_cible["illimite"] = False
+    user_cible.pop("vip_debut", None)
+    user_cible.pop("vip_fin", None)
     sauvegarder_users(data)
 
     await update.message.reply_text(
-        f"✅ Client `{code_cible}` rechargé avec *{nombre}* signal{'s' if nombre > 1 else ''} VIP.\n"
-        f"👑 Il lui reste maintenant *{nombre}* signaux VIP.",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ Client <code>{echapper_html_texte(code_cible)}</code> rechargé avec <b>{nombre}</b> signal{'s' if nombre > 1 else ''} VIP.\n"
+        f"👑 Il lui reste maintenant <b>{nombre}</b> signaux VIP.",
+        parse_mode=ParseMode.HTML,
     )
 
     try:
@@ -713,10 +843,10 @@ async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "🎉 Bonne nouvelle !\n\n"
                 "Tes signaux VIP ont été rechargés par l'administrateur.\n"
-                f"👑 Il vous reste *{nombre}* signaux VIP.\n\n"
+                f"👑 Il vous reste <b>{nombre}</b> signaux VIP.\n\n"
                 "Appuie sur /start pour continuer."
             ),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
@@ -731,10 +861,10 @@ async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sauvegarder_admin_id(update.effective_user.id)
     data = migrer_si_besoin(charger_users())
     if not data:
-        await update.message.reply_text("Aucun client enregistré.")
+        await update.message.reply_text("Aucun client enregistré.", parse_mode=ParseMode.HTML)
         return
 
-    lignes = ["👥 *Liste des clients :*\n"]
+    lignes = ["👥 <b>Liste des clients :</b>\n"]
     for user in data.values():
         if not isinstance(user, dict):
             continue
@@ -746,19 +876,19 @@ async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
             vip_fin = user.get("vip_fin")
             jours_restants = jours_restants_jusqua(vip_fin)
             ligne = (
-                f"💎 `{code}` — Abonnement VIP illimité\n"
-                f"   💳 Début : {formater_date(vip_debut)}\n"
-                f"   📆 Expire le : {formater_date(vip_fin)} ({jours_restants}j restants)"
+                f"💎 <code>{echapper_html_texte(code)}</code> — Abonnement VIP illimité\n"
+                f"   💳 Début : {echapper_html_texte(formater_date(vip_debut))}\n"
+                f"   📆 Expire le : {echapper_html_texte(formater_date(vip_fin))} ({jours_restants}j restants)"
             )
         elif user.get("vip"):
             restants = normaliser_signaux_vip(user)
-            ligne = f"👑 `{code}` — VIP classique — {restants} signal{'s' if restants > 1 else ''} VIP"
+            ligne = f"👑 <code>{echapper_html_texte(code)}</code> — VIP classique — {restants} signal{'s' if restants > 1 else ''} VIP"
         else:
             restants = normaliser_signaux_gratuits(user)
-            ligne = f"🆓 `{code}` — Gratuit — {restants} signal{'s' if restants > 1 else ''} gratuit{'s' if restants > 1 else ''}"
+            ligne = f"🆓 <code>{echapper_html_texte(code)}</code> — Gratuit — {restants} signal{'s' if restants > 1 else ''} gratuit{'s' if restants > 1 else ''}"
         lignes.append(ligne)
 
-    await update.message.reply_text("\n".join(lignes), parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("\n".join(lignes), parse_mode=ParseMode.HTML)
 
 
 @handler_securise
@@ -769,7 +899,7 @@ async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sauvegarder_admin_id(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage : `/vip CODE`\nEx: `/vip A3K9F2`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage : <code>/vip CODE</code>\nEx: <code>/vip A3K9F2</code>", parse_mode=ParseMode.HTML)
         return
 
     code_cible = context.args[0].upper()
@@ -777,7 +907,7 @@ async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid_cible = trouver_uid_par_code(data, code_cible)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
     user_cible = data[uid_cible]
@@ -790,8 +920,8 @@ async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_cible.pop("vip_fin", None)
     sauvegarder_users(data)
     await update.message.reply_text(
-        f"✅ Client `{code_cible}` est maintenant VIP classique 👑\nLe client peut maintenant recevoir des recharges de signaux.",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ Client <code>{echapper_html_texte(code_cible)}</code> est maintenant VIP classique 👑\nLe client peut maintenant recevoir des recharges de signaux.",
+        parse_mode=ParseMode.HTML,
     )
 
     try:
@@ -803,6 +933,7 @@ async def activer_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "L'administrateur peut maintenant recharger votre compte selon le pack acheté.\n\n"
                 "Tapez /start pour continuer."
             ),
+            parse_mode=ParseMode.HTML,
         )
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
@@ -816,7 +947,7 @@ async def abonnement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sauvegarder_admin_id(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage : `/abonnement CODE`\nEx: `/abonnement A3K9F2`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage : <code>/abonnement CODE</code>\nEx: <code>/abonnement A3K9F2</code>", parse_mode=ParseMode.HTML)
         return
 
     code_cible = context.args[0].upper()
@@ -824,7 +955,7 @@ async def abonnement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid_cible = trouver_uid_par_code(data, code_cible)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
     maintenant = datetime.datetime.now()
@@ -835,31 +966,32 @@ async def abonnement_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_cible["illimite"] = True
     user_cible["vip_debut"] = maintenant.timestamp()
     user_cible["vip_fin"] = fin.timestamp()
-    user_cible["restants"] = normaliser_signaux_vip(user_cible)
+    user_cible["vip_signals"] = 0
+    user_cible["restants"] = None
     sauvegarder_users(data)
 
     await update.message.reply_text(
-        f"✅ Abonnement mensuel activé pour `{code_cible}` 👑\n\n"
+        f"✅ Abonnement mensuel activé pour <code>{echapper_html_texte(code_cible)}</code> 👑\n\n"
         "♾️ Signaux illimités activés immédiatement.\n\n"
-        f"📅 Début : *{maintenant.strftime('%d/%m/%Y')}*\n"
-        f"📆 Fin : *{fin.strftime('%d/%m/%Y')}*",
-        parse_mode=ParseMode.MARKDOWN,
+        f"📅 Début : <b>{maintenant.strftime('%d/%m/%Y')}</b>\n"
+        f"📆 Fin : <b>{fin.strftime('%d/%m/%Y')}</b>",
+        parse_mode=ParseMode.HTML,
     )
 
     try:
         await context.bot.send_message(
             chat_id=int(uid_cible),
             text=(
-                "🎉 Ton abonnement *VIP* est activé ! 👑\n\n"
+                "🎉 Ton abonnement <b>VIP</b> est activé ! 👑\n\n"
                 "━━━━━━━━━━━━━━━━━━\n"
-                f"📅 Début : *{maintenant.strftime('%d/%m/%Y')}*\n"
-                f"📆 Expire le : *{fin.strftime('%d/%m/%Y')}*\n"
-                "⏳ Durée : *30 jours*\n"
+                f"📅 Début : <b>{maintenant.strftime('%d/%m/%Y')}</b>\n"
+                f"📆 Expire le : <b>{fin.strftime('%d/%m/%Y')}</b>\n"
+                "⏳ Durée : <b>30 jours</b>\n"
                 "♾️ Signaux illimités\n"
                 "━━━━━━━━━━━━━━━━━━\n\n"
                 "Tape /start pour voir ton abonnement."
             ),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
@@ -873,7 +1005,7 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     sauvegarder_admin_id(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage : `/devip CODE`\nEx: `/devip A3K9F2`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage : <code>/devip CODE</code>\nEx: <code>/devip A3K9F2</code>", parse_mode=ParseMode.HTML)
         return
 
     code_cible = context.args[0].upper()
@@ -881,26 +1013,26 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid_cible = trouver_uid_par_code(data, code_cible)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
     gratuits = remettre_en_mode_gratuit(data[uid_cible])
     sauvegarder_users(data)
     statut = (
-        f"⚡ Il reste *{gratuits}* signal{'s' if gratuits > 1 else ''} gratuit{'s' if gratuits > 1 else ''}."
+        f"⚡ Il reste <b>{gratuits}</b> signal{'s' if gratuits > 1 else ''} gratuit{'s' if gratuits > 1 else ''}."
         if gratuits > 0
         else "❌ Vous avez épuisé vos signaux gratuits.\n\n💎 Contactez l'administrateur pour recharger votre compte."
     )
     await update.message.reply_text(
-        f"✅ Statut VIP retiré au client `{code_cible}`.\n\n{statut}",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ Statut VIP retiré au client <code>{echapper_html_texte(code_cible)}</code>.\n\n{statut}",
+        parse_mode=ParseMode.HTML,
     )
 
     try:
         await context.bot.send_message(
             chat_id=int(uid_cible),
             text=f"⚠️ Votre statut VIP a été retiré.\n\n{statut}",
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
@@ -914,7 +1046,7 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sauvegarder_admin_id(update.effective_user.id)
     if not context.args:
-        await update.message.reply_text("Usage : `/desabo CODE`\nEx: `/desabo A3K9F2`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage : <code>/desabo CODE</code>\nEx: <code>/desabo A3K9F2</code>", parse_mode=ParseMode.HTML)
         return
 
     code_cible = context.args[0].upper()
@@ -922,19 +1054,19 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid_cible = trouver_uid_par_code(data, code_cible)
 
     if uid_cible is None:
-        await update.message.reply_text(f"❌ Aucun client trouvé avec le code `{code_cible}`.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
         return
 
     gratuits = remettre_en_mode_gratuit(data[uid_cible])
     sauvegarder_users(data)
     statut = (
-        f"⚡ Il reste *{gratuits}* signal{'s' if gratuits > 1 else ''} gratuit{'s' if gratuits > 1 else ''}."
+        f"⚡ Il reste <b>{gratuits}</b> signal{'s' if gratuits > 1 else ''} gratuit{'s' if gratuits > 1 else ''}."
         if gratuits > 0
         else "❌ Vous avez épuisé vos signaux gratuits.\n\n💎 Contactez l'administrateur."
     )
     await update.message.reply_text(
-        f"✅ Abonnement mensuel coupé pour `{code_cible}`.\n\n{statut}",
-        parse_mode=ParseMode.MARKDOWN,
+        f"✅ Abonnement mensuel coupé pour <code>{echapper_html_texte(code_cible)}</code>.\n\n{statut}",
+        parse_mode=ParseMode.HTML,
     )
 
     try:
@@ -943,9 +1075,9 @@ async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "⚠️ Ton abonnement mensuel VIP a été désactivé.\n\n"
                 f"{statut}\n\n"
-                f"Pour renouveler, contacte l'admin : @{ADMIN_USERNAME}"
+                f"Pour renouveler, contacte l'admin : {admin_username_html()}"
             ),
-            parse_mode=ParseMode.MARKDOWN,
+            parse_mode=ParseMode.HTML,
         )
     except TelegramError:
         logger.exception("Impossible de notifier le client %s.", uid_cible)
@@ -981,11 +1113,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🆓 Membres gratuits : {gratuits}"
     )
     if bientot:
-        texte += "\n\n⚠️ *Abonnements qui expirent bientôt :*"
+        texte += "\n\n⚠️ <b>Abonnements qui expirent bientôt :</b>"
         for code, jours in bientot:
-            texte += f"\n• `{code}` — expire dans {jours} jour{'s' if jours > 1 else ''}"
+            texte += f"\n• <code>{echapper_html_texte(code)}</code> — expire dans {jours} jour{'s' if jours > 1 else ''}"
 
-    await update.message.reply_text(texte, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
 
 
 @handler_securise
@@ -997,14 +1129,15 @@ async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sauvegarder_admin_id(update.effective_user.id)
     await update.message.reply_text(
         "🛠 Commandes admin disponibles :\n\n"
-        "/clients — Liste tous les clients et leur statut\n"
-        "/stats — Statistiques générales du bot\n"
-        "/recharge CODE NOMBRE — Recharge un VIP classique\n"
-        "/vip CODE — Active le VIP classique, sans signaux automatiques\n"
-        "/devip CODE — Retire le statut VIP d'un client\n"
-        "/abonnement CODE — Abonnement VIP illimité 30j\n"
-        "/desabo CODE — Coupe l'abonnement mensuel d'un client\n"
-        "/admin — Affiche ce menu"
+        "<code>/clients</code> — Liste tous les clients et leur statut\n"
+        "<code>/stats</code> — Statistiques générales du bot\n"
+        "<code>/recharge CODE NOMBRE</code> — Recharge un VIP classique\n"
+        "<code>/vip CODE</code> — Active le VIP classique, sans signaux automatiques\n"
+        "<code>/devip CODE</code> — Retire le statut VIP d'un client\n"
+        "<code>/abonnement CODE</code> — Abonnement VIP illimité 30j\n"
+        "<code>/desabo CODE</code> — Coupe l'abonnement mensuel d'un client\n"
+        "<code>/admin</code> — Affiche ce menu",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -1024,7 +1157,8 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if deja_en_cours:
         await query.answer("⏳ Une analyse est déjà en cours.", show_alert=False)
         msg = await query.message.reply_text(
-            "⏳ Une analyse est déjà en cours.\n\nPatiente quelques secondes..."
+            "⏳ Une analyse est déjà en cours.\n\nPatiente quelques secondes...",
+            parse_mode=ParseMode.HTML,
         )
         sauvegarder_message_id(user_id, msg.message_id)
         return
@@ -1038,30 +1172,30 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         normaliser_signaux_restants(user)
         if expire:
             sauvegarder_users(data)
-            msg = await query.message.reply_text(
+            msg = await remplacer_message(
+                query,
                 texte_expiration(user),
-                reply_markup=bouton_vip() if user.get("restants", 0) <= 0 else bouton_signal(restants=user.get("restants", 0)),
-                parse_mode=ParseMode.MARKDOWN,
+                bouton_vip() if user.get("restants", 0) <= 0 else bouton_signal(restants=user.get("restants", 0)),
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
         attente = get_secondes_restantes(user)
         if attente > 0:
-            msg = await query.message.reply_text(
-                "⏳ *Le robot termine l'analyse précédente.*\n\n"
+            msg = await remplacer_message(
+                query,
+                "⏳ <b>Le robot termine l'analyse précédente.</b>\n\n"
                 "Temps restant :\n\n"
-                f"*{attente} seconde{'s' if attente > 1 else ''}.*",
-                parse_mode=ParseMode.MARKDOWN,
+                f"<b>{attente} seconde{'s' if attente > 1 else ''}.</b>",
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
         if not peut_obtenir_signal(user):
-            msg = await query.message.reply_text(
+            msg = await remplacer_message(
+                query,
                 texte_compteur_compte(user),
-                reply_markup=bouton_vip(),
-                parse_mode=ParseMode.MARKDOWN,
+                bouton_vip(),
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
@@ -1074,85 +1208,85 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         normaliser_signaux_restants(user)
         if expire:
             sauvegarder_users(data)
-            msg = await query.message.reply_text(
+            msg = await remplacer_message(
+                query,
                 texte_expiration(user),
-                reply_markup=bouton_vip() if user.get("restants", 0) <= 0 else bouton_signal(restants=user.get("restants", 0)),
-                parse_mode=ParseMode.MARKDOWN,
+                bouton_vip() if user.get("restants", 0) <= 0 else bouton_signal(restants=user.get("restants", 0)),
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
         if not peut_obtenir_signal(user):
-            msg = await query.message.reply_text(
+            msg = await remplacer_message(
+                query,
                 texte_compteur_compte(user),
-                reply_markup=bouton_vip(),
-                parse_mode=ParseMode.MARKDOWN,
+                bouton_vip(),
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
         if not opportunite_marche_disponible(user):
-            msg = await query.message.reply_text(
-                "⚠️ *Analyse du marché en cours.*\n\n"
+            msg = await remplacer_message(
+                query,
+                "⚠️ <b>Analyse du marché en cours.</b>\n\n"
                 "Aucune opportunité fiable détectée.\n\n"
-                "Réessaie dans quelques minutes.",
-                reply_markup=bouton_signal(
+                "Réessaie dans 4 minutes.",
+                bouton_signal(
                     restants=user.get("restants"),
                     vip=user.get("vip", False),
                     illimite=abonnement_actif(user),
                 ),
-                parse_mode=ParseMode.MARKDOWN,
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
-        signal_txt, signal_genere = generer_signal()
+        signal_txt, signal_genere = generer_signal(user)
         if not signal_txt:
-            msg = await query.message.reply_text(
+            msg = await remplacer_message(
+                query,
                 "⚠️ Impossible de générer une prédiction pour le moment.\n\nRéessaie dans quelques instants.",
-                reply_markup=bouton_signal(
+                bouton_signal(
                     restants=user.get("restants"),
                     vip=user.get("vip", False),
                     illimite=abonnement_actif(user),
                 ),
-                parse_mode=ParseMode.MARKDOWN,
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
         if not signal_genere:
-            msg = await query.message.reply_text(
+            msg = await remplacer_message(
+                query,
                 signal_txt,
-                reply_markup=bouton_signal(
+                bouton_signal(
                     restants=user.get("restants"),
                     vip=user.get("vip", False),
                     illimite=abonnement_actif(user),
                 ),
-                parse_mode=ParseMode.MARKDOWN,
             )
             sauvegarder_message_id(user_id, msg.message_id)
             return
 
         etat = consommer_signal(user_id, signal_txt=signal_txt)
         if etat["illimite"]:
-            texte = f"{signal_txt}\n\n👑 *Abonnement VIP actif*\n♾️ Signaux illimités"
+            texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
             markup = bouton_signal(vip=True, illimite=True)
         elif etat["mode"] == "vip":
             restants_apres = etat["restants"]
             if restants_apres > 0:
-                texte = f"{signal_txt}\n\n👑 Il vous reste *{restants_apres}* signaux VIP."
+                texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
                 markup = bouton_signal(restants=restants_apres, vip=True)
             else:
                 texte = (
                     f"{signal_txt}\n\n"
-                    "⚠️ *Dernier signal VIP utilisé.*\n"
+                    "⚠️ <b>Dernier signal VIP utilisé.</b>\n"
                     "💎 Contactez l'administrateur pour recharger votre compte."
                 )
                 markup = bouton_vip()
         else:
             restants_apres = etat["restants"]
             if restants_apres > 0:
-                texte = f"{signal_txt}\n\n⚡ Il vous reste *{restants_apres}* signaux gratuits."
+                texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
                 markup = bouton_signal(restants=restants_apres)
             else:
                 texte = (
@@ -1162,30 +1296,198 @@ async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 markup = bouton_vip()
 
-        msg = await query.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.MARKDOWN)
+        msg = await remplacer_message(query, texte, markup)
         sauvegarder_message_id(user_id, msg.message_id)
     finally:
         with analyses_lock:
             analyses_en_cours.discard(uid)
 
+
+@handler_securise
+async def compte_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le sous-menu "Mon compte" """
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    msg = await remplacer_message(
+        query,
+        "👑 <b>MON COMPTE</b>\n\n"
+        "Sélectionne une option :",
+        bouton_compte(),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def vip_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le sous-menu "VIP & Support" """
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    msg = await remplacer_message(
+        query,
+        "💎 <b>ESPACE VIP & SUPPORT</b>\n\n"
+        "Sélectionne une option :",
+        bouton_vip_menu(),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def retour_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retour au menu principal"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    data, uid = get_ou_creer_user(user_id)
+    user = data[uid]
+    restants = user.get("restants", 0)
+    
+    msg = await remplacer_message(
+        query,
+        "🎰 <b>MENU PRINCIPAL</b>\n\nChoisir une action :",
+        bouton_signal(restants=restants, vip=user.get("vip", False), illimite=abonnement_actif(user)),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
 @handler_securise
 async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = query.from_user.id
     await query.answer()
-    msg = await query.message.reply_text(
-        "💎 *Offres VIP — Signaux Lucky Jet*\n\n"
+    
+    msg = await remplacer_message(
+        query,
+        "💎 <b>PACKS VIP</b>\n\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "🥉 Starter — 100 signaux\n"
-        "🥈 Standard — 250 signaux\n"
-        "🥇 Pro — 500 signaux\n"
-        "💼 Elite — 1000 signaux\n"
-        "💎 Abonnement VIP — ♾️ signaux illimités / 30 jours\n"
+        "🥉 <b>Starter</b>\n"
+        "100 signaux → 2 000 FCFA\n\n"
+        "🥈 <b>Standard</b>\n"
+        "250 signaux → 4 000 FCFA\n\n"
+        "🥇 <b>Pro</b>\n"
+        "500 signaux → 7 000 FCFA\n\n"
+        "👑 <b>VIP Mensuel</b>\n"
+        "♾️ Signaux illimités pendant 30 jours\n"
+        "12 000 FCFA\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        "💳 Paiement via Wave / Moov Money\n\n"
-        f"👉 Contacte l'admin : @{ADMIN_USERNAME}",
-        parse_mode=ParseMode.MARKDOWN,
+        "<b>💳 Paiement :</b>\n"
+        "Wave / Moov Money\n\n"
+        "<b>📞 Contact Admin</b>\n"
+        f"{admin_username_html()}",
     )
-    sauvegarder_message_id(query.from_user.id, msg.message_id)
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def historique_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    data, uid = get_ou_creer_user(user_id)
+    historique = data[uid].get("historique_signaux", [])[-4:]
+
+    if not historique:
+        texte = "📊 <b>Derniers signaux</b>\n\nAucun signal enregistré pour le moment."
+    else:
+        lignes = ["📊 <b>Derniers signaux</b>\n"]
+        for entree in reversed(historique):
+            signal = entree.get("signal", "")
+            match = re.search(r"Multiplicateur\*\n`([0-9]+(?:\.[0-9]+)?)x`", signal)
+            if match:
+                lignes.append(f"<code>{echapper_html_texte(match.group(1))}x</code>")
+        texte = "\n\n".join(lignes) if len(lignes) > 1 else "📊 <b>Derniers signaux</b>\n\nAucun signal lisible."
+
+    msg = await remplacer_message(query, texte, bouton_compte())
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def abonnement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    data, uid = get_ou_creer_user(user_id)
+    user = data[uid]
+    appliquer_expiration_si_necessaire(user)
+    normaliser_signaux_restants(user)
+    sauvegarder_users(data)
+
+    if abonnement_actif(user):
+        texte = (
+            "━━━━━━━━━━━━━━\n"
+            "👑 <b>Mon abonnement</b>\n\n"
+            f"📅 Début\n<b>{echapper_html_texte(formater_date(user.get('vip_debut')))}</b>\n\n"
+            "🎟 Signaux\n<b>♾️ Illimité</b>\n\n"
+            f"📆 Expiration\n<b>{echapper_html_texte(formater_date(user.get('vip_fin')))}</b>\n"
+            "━━━━━━━━━━━━━━"
+        )
+    elif user.get("vip"):
+        texte = (
+            "━━━━━━━━━━━━━━\n"
+            "👑 <b>VIP classique</b>\n\n"
+            "🎟 Signaux restants\n"
+            f"<b>{normaliser_signaux_vip(user)}</b>\n"
+            "━━━━━━━━━━━━━━"
+        )
+    else:
+        texte = (
+            "━━━━━━━━━━━━━━\n"
+            "🆓 <b>Compte gratuit</b>\n\n"
+            "🎟 Signaux restants\n"
+            f"<b>{normaliser_signaux_gratuits(user)}</b>\n"
+            "━━━━━━━━━━━━━━"
+        )
+
+    msg = await remplacer_message(query, texte, bouton_compte())
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le message de support officiel premium"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+
+    msg = await remplacer_message(
+        query,
+        "📞 <b>SUPPORT OFFICIEL</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>Besoin d'aide ?</b>\n\n"
+        "Nous sommes disponibles pour :\n\n"
+        "💳 Recharge de signaux\n"
+        "👑 Activation VIP\n"
+        "♾️ Abonnement mensuel\n"
+        "❓ Questions sur le bot\n"
+        "⚙️ Assistance technique\n"
+        "💰 Problème de paiement\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>👤 Contact de l'administrateur</b>\n\n"
+        f"👉 {admin_username_html()}\n\n"
+        "⏰ Réponse généralement en quelques minutes.",
+        bouton_vip_menu(),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    data, uid = get_ou_creer_user(user_id)
+    
+    msg = await remplacer_message(
+        query,
+        f"ℹ️ <b>Mon code client</b>\n\n<code>{echapper_html_texte(data[uid]['code'])}</code>\n\n"
+        "Ce code te permet de recharger tes signaux auprès de l'admin.",
+        bouton_compte(),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
 
 
 @handler_securise
@@ -1221,7 +1523,7 @@ async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=int(uid),
                 text=message_client,
-                parse_mode=ParseMode.MARKDOWN,
+                parse_mode=ParseMode.HTML,
             )
         except TelegramError:
             logger.exception("Impossible de notifier le client %s pour l'expiration.", uid)
@@ -1231,12 +1533,12 @@ async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     chat_id=admin_id,
                     text=(
-                        "⚠️ *Abonnement VIP expiré automatiquement !*\n\n"
-                        f"🔑 Code client : `{code}`\n"
-                        f"📆 Date d'expiration : *{date_fin}*\n\n"
+                        "⚠️ <b>Abonnement VIP expiré automatiquement !</b>\n\n"
+                        f"🔑 Code client : <code>{echapper_html_texte(code)}</code>\n"
+                        f"📆 Date d'expiration : <b>{echapper_html_texte(date_fin)}</b>\n\n"
                         "Le statut VIP et l'accès illimité ont été retirés."
                     ),
-                    parse_mode=ParseMode.MARKDOWN,
+                    parse_mode=ParseMode.HTML,
                 )
             except TelegramError:
                 logger.exception("Impossible de notifier l'admin pour l'expiration %s.", code)
@@ -1280,9 +1582,21 @@ def creer_application():
     app.add_handler(CommandHandler("devip", desactiver_vip_cmd))
     app.add_handler(CommandHandler("desabo", desabonner_cmd))
     app.add_handler(CommandHandler("admin", admin_help))
+    
+    # Handlers de callback - Menu principal
     app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
+    app.add_handler(CallbackQueryHandler(compte_menu_callback, pattern="^compte_menu$"))
+    app.add_handler(CallbackQueryHandler(vip_menu_callback, pattern="^vip_menu$"))
+    app.add_handler(CallbackQueryHandler(retour_callback, pattern="^retour$"))
+    
+    # Handlers de callback - Sous-menus
     app.add_handler(CallbackQueryHandler(vip_callback, pattern="^vip$"))
+    app.add_handler(CallbackQueryHandler(historique_callback, pattern="^historique$"))
+    app.add_handler(CallbackQueryHandler(abonnement_callback, pattern="^abonnement$"))
+    app.add_handler(CallbackQueryHandler(support_callback, pattern="^support$"))
+    app.add_handler(CallbackQueryHandler(code_callback, pattern="^code$"))
     app.add_handler(CallbackQueryHandler(effacer_callback, pattern="^effacer$"))
+    
     app.add_error_handler(error_handler)
 
     if app.job_queue:
