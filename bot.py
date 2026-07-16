@@ -24,7 +24,7 @@ from telegram.ext import (
 )
 
 
-TOKEN = "8886184186:AAFYXUJ9ahtYq_V-gRU8GQj6wKrSnfJdKf4"
+TOKEN = os.environ.get("BOT_TOKEN")
 DATA_FILE = "users.json"
 ADMIN_ID_FILE = "admin_id.json"
 SIGNAUX_DEFAUT = 3
