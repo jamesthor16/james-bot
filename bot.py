@@ -1435,10 +1435,10 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
 
-async def main():
+def main():
     """Fonction principale pour démarrer le bot"""
     initialiser_db()
-    
+
     # Créer l'application
     application = ApplicationBuilder().token(TOKEN).build()
 
@@ -1460,8 +1460,8 @@ async def main():
     application.add_error_handler(error_handler)
 
     # Démarrer le bot
-    await application.run_polling()
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
