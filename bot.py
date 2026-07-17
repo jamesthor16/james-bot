@@ -8,11 +8,9 @@ import random
 import re
 import string
 import threading
-import sqlite3
 from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from json import JSONDecodeError
-from contextlib import contextmanager
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -28,7 +26,6 @@ from telegram.ext import (
 
 TOKEN = os.environ.get("BOT_TOKEN")
 DATA_FILE = "users.json"
-DATABASE_FILE = "bot_data.db"
 ADMIN_ID_FILE = "admin_id.json"
 SIGNAUX_DEFAUT = 3
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "hacker_ci").lstrip("@")
@@ -57,86 +54,6 @@ file_lock = threading.RLock()
 json_cache = {}
 analyses_lock = threading.Lock()
 analyses_en_cours = set()
-
-
-# ===== BASE DE DONNÉES SQLITE =====
-
-@contextmanager
-def get_db():
-    """Gestionnaire de contexte pour la base de données SQLite"""
-    conn = sqlite3.connect(DATABASE_FILE)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        logger.exception("Erreur base de données", exc_info=e)
-    finally:
-        conn.close()
-
-
-def initialiser_db():
-    """Crée les tables nécessaires"""
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        # Table utilisateurs
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS utilisateurs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id TEXT UNIQUE NOT NULL,
-                code TEXT UNIQUE NOT NULL,
-                vip BOOLEAN DEFAULT 0,
-                illimite BOOLEAN DEFAULT 0,
-                signaux_restants INTEGER DEFAULT 3,
-                signaux_gratuits INTEGER DEFAULT 3,
-                signaux_vip INTEGER DEFAULT 0,
-                dernier_signal REAL,
-                vip_debut REAL,
-                vip_fin REAL,
-                date_creation TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                date_maj TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Table ventes
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ventes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id TEXT NOT NULL,
-                code TEXT NOT NULL,
-                pack TEXT NOT NULL,
-                montant REAL NOT NULL,
-                date_vente TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Table signaux
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS signaux_historique (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id TEXT NOT NULL,
-                code TEXT NOT NULL,
-                coefficient REAL NOT NULL,
-                assurance REAL NOT NULL,
-                fiabilite REAL NOT NULL,
-                heure TEXT NOT NULL,
-                statut TEXT NOT NULL,
-                date_signal TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Table logs administrateur
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS logs_admin (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                admin_username TEXT NOT NULL,
-                action TEXT NOT NULL,
-                details TEXT,
-                date_action TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
 
 
 def lire_json(path, default):
@@ -728,75 +645,6 @@ async def remplacer_message(query, texte, markup=None):
     )
 
 
-# ===== GESTION DES STATS ET ADMIN =====
-
-def get_statistiques_admin():
-    """Retourne les statistiques complètes du bot"""
-    data = charger_users()
-    
-    total_users = len([u for u in data.values() if isinstance(u, dict)])
-    vip_users = len([u for u in data.values() if isinstance(u, dict) and u.get("vip")])
-    free_users = total_users - vip_users
-    
-    active_today = len([
-        u for u in data.values() 
-        if isinstance(u, dict) and u.get("dernier_signal") and 
-        (datetime.datetime.now().timestamp() - timestamp_ou_none(u.get("dernier_signal", 0)) < 86400)
-    ])
-    
-    return {
-        "total": total_users,
-        "vip": vip_users,
-        "free": free_users,
-        "active_today": active_today,
-    }
-
-
-def generer_texte_dashboard():
-    """Génère le texte du dashboard administrateur"""
-    stats = get_statistiques_admin()
-    data = charger_users()
-    
-    # Compter les packs
-    starter = sum(1 for u in data.values() if isinstance(u, dict) and u.get("vip") and u.get("vip_signals", 0) <= 100)
-    standard = sum(1 for u in data.values() if isinstance(u, dict) and u.get("vip") and 100 < u.get("vip_signals", 0) <= 250)
-    pro = sum(1 for u in data.values() if isinstance(u, dict) and u.get("vip") and 250 < u.get("vip_signals", 0) <= 500)
-    monthly = sum(1 for u in data.values() if isinstance(u, dict) and u.get("illimite"))
-    
-    texte = (
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🚀 <b>LUCKY JET AI PANEL</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<b>👥 Utilisateurs</b>\n"
-        f"Total : <code>{stats['total']}</code>\n"
-        f"👑 VIP : <code>{stats['vip']}</code>\n"
-        f"🆓 Gratuit : <code>{stats['free']}</code>\n"
-        f"🟢 Actifs aujourd'hui : <code>{stats['active_today']}</code>\n\n"
-        "<b>📦 Packs vendus</b>\n"
-        f"🥉 Starter : <code>{starter}</code>\n"
-        f"🥈 Standard : <code>{standard}</code>\n"
-        f"🥇 Pro : <code>{pro}</code>\n"
-        f"👑 Mensuel : <code>{monthly}</code>\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🟢 <b>Bot EN LIGNE</b>"
-    )
-    
-    return texte
-
-
-def bouton_admin_menu():
-    """Menu admin"""
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📊 Dashboard", callback_data="admin_dashboard")],
-            [InlineKeyboardButton("🔍 Chercher client", callback_data="admin_search")],
-            [InlineKeyboardButton("💰 Ventes récentes", callback_data="admin_ventes")],
-            [InlineKeyboardButton("📝 Logs", callback_data="admin_logs")],
-            [InlineKeyboardButton("⬅️ Retour", callback_data="retour")],
-        ]
-    )
-
-
 def handler_securise(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -921,226 +769,6 @@ async def mon_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @handler_securise
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère tous les callbacks des boutons"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    data, uid = get_ou_creer_user(user_id)
-    user = data[uid]
-    
-    await query.answer()
-    
-    # Gestion des menus
-    if query.data == "compte_menu":
-        msg = await remplacer_message(
-            query,
-            "👑 <b>MON COMPTE</b>\n\nQue veux-tu voir ?",
-            bouton_compte()
-        )
-        sauvegarder_message_id(user_id, msg.message_id)
-    
-    elif query.data == "vip_menu":
-        msg = await remplacer_message(
-            query,
-            "💎 <b>VIP & SUPPORT</b>\n\nComment puis-je t'aider ?",
-            bouton_vip_menu()
-        )
-        sauvegarder_message_id(user_id, msg.message_id)
-    
-    elif query.data == "retour":
-        # Retour au menu principal
-        code = user.get("code", "?")
-        vip = user.get("vip", False)
-        restants = user.get("restants", 0)
-        illimite = abonnement_actif(user)
-        
-        if illimite:
-            vip_debut = user.get("vip_debut")
-            vip_fin = user.get("vip_fin")
-            jours_restants = jours_restants_jusqua(vip_fin)
-            texte = (
-                "━━━━━━━━━━━━━━━━━━\n"
-                "👑 <b>ESPACE VIP PREMIUM</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                f"🔑 Code client : <code>{echapper_html_texte(code)}</code>\n\n"
-                f"📅 Début : <b>{echapper_html_texte(formater_date(vip_debut))}</b>\n"
-                f"📆 Expire le : <b>{echapper_html_texte(formater_date(vip_fin))}</b>\n"
-                f"⏳ Jours restants : <b>{jours_restants} jour{'s' if jours_restants > 1 else ''}</b>\n\n"
-                f"{texte_compteur_compte(user)}\n\n"
-                "🎰 Lance une analyse pour obtenir le prochain signal."
-            )
-            markup = bouton_signal(vip=vip, illimite=True)
-        else:
-            texte = (
-                "━━━━━━━━━━━━━━━━━━\n"
-                "🎰 <b>LUCKY JET PREMIUM</b>\n"
-                "━━━━━━━━━━━━━━━━━━\n\n"
-                f"🔑 Code client : <code>{echapper_html_texte(code)}</code>\n\n"
-                f"{texte_compteur_compte(user)}\n\n"
-                "🎯 Appuie sur le bouton pour lancer une analyse."
-            )
-            markup = bouton_signal(restants=restants, vip=vip) if restants > 0 else bouton_vip()
-        
-        msg = await remplacer_message(query, texte, markup)
-        sauvegarder_message_id(user_id, msg.message_id)
-    
-    elif query.data == "code":
-        texte_code = (
-            "🔑 <b>MON CODE CLIENT</b>\n\n"
-            f"<code>{echapper_html_texte(user.get('code', '?'))}</code>\n\n"
-            "Donne ce code à l'administrateur pour recharger tes signaux.\n\n"
-            "⬅️ Appuie pour retourner au menu."
-        )
-        msg = await remplacer_message(
-            query,
-            texte_code,
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="retour")]])
-        )
-        sauvegarder_message_id(user_id, msg.message_id)
-    
-    elif query.data == "historique":
-        historique = user.get("historique_signaux", [])[-5:]
-        if not historique:
-            texte_historique = "📊 <b>MES SIGNAUX</b>\n\nAucun signal enregistré."
-        else:
-            lignes = ["📊 <b>MES 5 DERNIERS SIGNAUX</b>\n"]
-            for i, signal in enumerate(historique, 1):
-                date = signal.get("date", "?")
-                statut = signal.get("statut", "?")
-                lignes.append(f"{i}. <b>{date}</b> ({statut})")
-            texte_historique = "\n".join(lignes)
-        
-        msg = await remplacer_message(
-            query,
-            texte_historique,
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="compte_menu")]])
-        )
-        sauvegarder_message_id(user_id, msg.message_id)
-    
-    elif query.data == "abonnement":
-        if abonnement_actif(user):
-            vip_fin = user.get("vip_fin")
-            jours_restants = jours_restants_jusqua(vip_fin)
-            texte_abo = (
-                "📅 <b>MON ABONNEMENT</b>\n\n"
-                f"👑 Statut : <b>VIP Actif</b>\n"
-                f"📆 Expire le : <b>{echapper_html_texte(formater_date(vip_fin))}</b>\n"
-                f"⏳ Jours restants : <b>{jours_restants}</b>\n"
-                f"♾️ Signaux : <b>Illimité</b>"
-            )
-        else:
-            restants = user.get("restants", 0)
-            if user.get("vip"):
-                texte_abo = (
-                    "📅 <b>MON ABONNEMENT</b>\n\n"
-                    f"👑 Statut : <b>VIP Classique</b>\n"
-                    f"🎟 Signaux restants : <b>{restants}</b>"
-                )
-            else:
-                texte_abo = (
-                    "📅 <b>MON ABONNEMENT</b>\n\n"
-                    f"🆓 Statut : <b>Gratuit</b>\n"
-                    f"🎟 Signaux restants : <b>{restants}</b>"
-                )
-        
-        msg = await remplacer_message(
-            query,
-            texte_abo,
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="compte_menu")]])
-        )
-        sauvegarder_message_id(user_id, msg.message_id)
-    
-    elif query.data == "support":
-        texte_support = (
-            "📞 <b>SUPPORT OFFICIEL</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "Besoin d'aide ?\n\n"
-            "Nous sommes disponibles pour :\n\n"
-            "💳 Recharge de signaux\n"
-            "👑 Activation VIP\n"
-            "♾️ Abonnement mensuel\n"
-            "❓ Questions sur le bot\n"
-            "⚙️ Assistance technique\n"
-            "💰 Problème de paiement\n\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "👤 <b>Contact de l'administrateur</b>\n\n"
-            f"👉 {admin_username_html()}\n\n"
-            "⏰ Réponse généralement en quelques minutes."
-        )
-        
-        msg = await remplacer_message(
-            query,
-            texte_support,
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="vip_menu")]])
-        )
-        sauvegarder_message_id(user_id, msg.message_id)
-    
-    elif query.data == "vip":
-        texte_vip = (
-            "💎 <b>PACKS VIP</b>\n\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "🥉 <b>Pack Starter</b>\n"
-            "100 signaux\n"
-            "4 000 FCFA\n\n"
-            "🥈 <b>Pack Standard</b>\n"
-            "250 signaux\n"
-            "8 000 FCFA\n\n"
-            "🥇 <b>Pack Pro</b>\n"
-            "500 signaux\n"
-            "14 000 FCFA\n\n"
-            "👑 <b>VIP Mensuel</b>\n"
-            "Signaux illimités\n"
-            "12 000 FCFA\n\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            f"Pour acheter, contacte : {admin_username_html()}"
-        )
-        
-        msg = await remplacer_message(
-            query,
-            texte_vip,
-            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="vip_menu")]])
-        )
-        sauvegarder_message_id(user_id, msg.message_id)
-    
-    elif query.data == "signal":
-        # Vérifier si l'utilisateur peut obtenir un signal
-        secondes = get_secondes_restantes(user)
-        if secondes > 0:
-            msg = await remplacer_message(
-                query,
-                f"⏳ <b>Cooldown en cours</b>\n\nAttends <b>{secondes}</b> secondes avant le prochain signal.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="retour")]])
-            )
-            sauvegarder_message_id(user_id, msg.message_id)
-            return
-        
-        if not peut_obtenir_signal(user):
-            msg = await remplacer_message(
-                query,
-                "❌ Tu n'as plus de signaux disponibles.\n\n💎 Contacte l'administrateur pour en acheter.",
-                bouton_vip()
-            )
-            sauvegarder_message_id(user_id, msg.message_id)
-            return
-        
-        # Lancer l'animation
-        await lancer_animation_analyse(query, user_id)
-        
-        # Générer le signal
-        signal_txt, valide = generer_signal(user)
-        if not valide:
-            msg = await query.message.reply_text(signal_txt, parse_mode=ParseMode.HTML)
-            sauvegarder_message_id(user_id, msg.message_id)
-            return
-        
-        # Consommer le signal
-        resultat = consommer_signal(user_id, signal_txt)
-        
-        msg = await query.message.reply_text(signal_txt, parse_mode=ParseMode.HTML)
-        sauvegarder_message_id(user_id, msg.message_id)
-
-
-@handler_securise
 async def recharger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not est_admin(update):
         await refuser_non_admin(update)
@@ -1261,27 +889,6 @@ async def clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lignes.append(ligne)
 
     await update.message.reply_text("\n".join(lignes), parse_mode=ParseMode.HTML)
-
-
-@handler_securise
-async def dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le dashboard admin"""
-    if not est_admin(update):
-        await refuser_non_admin(update)
-        return
-
-    sauvegarder_admin_id(update.effective_user.id)
-    
-    texte = generer_texte_dashboard()
-    
-    markup = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Rafraîchir", callback_data="admin_refresh")],
-        [InlineKeyboardButton("👥 Clients", callback_data="clients")],
-        [InlineKeyboardButton("ℹ️ Infos", callback_data="admin_info")],
-    ])
-    
-    msg = await update.message.reply_text(texte, reply_markup=markup, parse_mode=ParseMode.HTML)
-    sauvegarder_message_id(update.effective_user.id, msg.message_id)
 
 
 @handler_securise
@@ -1417,7 +1024,48 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else "❌ Vous avez épuisé vos signaux gratuits.\n\n💎 Contactez l'administrateur pour recharger votre compte."
     )
     await update.message.reply_text(
-        f"✅ Statut VIP retiré au client <code>{echapper_html_texte(code_cible)}</code> 👤\n\n{statut}",
+        f"✅ Statut VIP retiré au client <code>{echapper_html_texte(code_cible)}</code>.\n\n{statut}",
+        parse_mode=ParseMode.HTML,
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(uid_cible),
+            text=f"⚠️ Votre statut VIP a été retiré.\n\n{statut}",
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        logger.exception("Impossible de notifier le client %s.", uid_cible)
+
+
+@handler_securise
+async def desabonner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("Usage : <code>/desabo CODE</code>\nEx: <code>/desabo A3K9F2</code>", parse_mode=ParseMode.HTML)
+        return
+
+    code_cible = context.args[0].upper()
+    data = migrer_si_besoin(charger_users())
+    uid_cible = trouver_uid_par_code(data, code_cible)
+
+    if uid_cible is None:
+        await update.message.reply_text(f"❌ Aucun client trouvé avec le code <code>{echapper_html_texte(code_cible)}</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    gratuits = remettre_en_mode_gratuit(data[uid_cible])
+    sauvegarder_users(data)
+    statut = (
+        f"⚡ Il reste <b>{gratuits}</b> signal{'s' if gratuits > 1 else ''} gratuit{'s' if gratuits > 1 else ''}."
+        if gratuits > 0
+        else "❌ Vous avez épuisé vos signaux gratuits.\n\n💎 Contactez l'administrateur."
+    )
+    await update.message.reply_text(
+        f"✅ Abonnement mensuel coupé pour <code>{echapper_html_texte(code_cible)}</code>.\n\n{statut}",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1425,9 +1073,9 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await context.bot.send_message(
             chat_id=int(uid_cible),
             text=(
-                "⚠️ Votre statut VIP a été retiré par l'administrateur.\n\n"
+                "⚠️ Ton abonnement mensuel VIP a été désactivé.\n\n"
                 f"{statut}\n\n"
-                "Tapez /start pour continuer."
+                f"Pour renouveler, contacte l'admin : {admin_username_html()}"
             ),
             parse_mode=ParseMode.HTML,
         )
@@ -1435,32 +1083,541 @@ async def desactiver_vip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.exception("Impossible de notifier le client %s.", uid_cible)
 
 
+@handler_securise
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    data = migrer_si_besoin(charger_users())
+    utilisateurs = [u for u in data.values() if isinstance(u, dict)]
+    total = len(utilisateurs)
+    abonnements = sum(1 for u in utilisateurs if abonnement_actif(u))
+    vip_classiques = sum(1 for u in utilisateurs if u.get("vip") and not abonnement_actif(u))
+    gratuits = total - abonnements - vip_classiques
+
+    bientot = []
+    maintenant = datetime.datetime.now()
+    for user in utilisateurs:
+        if abonnement_actif(user) and user.get("vip_fin"):
+            jours = jours_restants_jusqua(user["vip_fin"], maintenant=maintenant)
+            if 0 <= jours <= 3:
+                bientot.append((user.get("code", "?"), jours))
+
+    texte = (
+        "📊 Statistiques du bot :\n\n"
+        f"👥 Total clients : {total}\n"
+        f"💎 Abonnements VIP illimités : {abonnements}\n"
+        f"👑 VIP classiques : {vip_classiques}\n"
+        f"🆓 Membres gratuits : {gratuits}"
+    )
+    if bientot:
+        texte += "\n\n⚠️ <b>Abonnements qui expirent bientôt :</b>"
+        for code, jours in bientot:
+            texte += f"\n• <code>{echapper_html_texte(code)}</code> — expire dans {jours} jour{'s' if jours > 1 else ''}"
+
+    await update.message.reply_text(texte, parse_mode=ParseMode.HTML)
+
+
+@handler_securise
+async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not est_admin(update):
+        await refuser_non_admin(update)
+        return
+
+    sauvegarder_admin_id(update.effective_user.id)
+    await update.message.reply_text(
+        "🛠 Commandes admin disponibles :\n\n"
+        "<code>/clients</code> — Liste tous les clients et leur statut\n"
+        "<code>/stats</code> — Statistiques générales du bot\n"
+        "<code>/recharge CODE NOMBRE</code> — Recharge un VIP classique\n"
+        "<code>/vip CODE</code> — Active le VIP classique, sans signaux automatiques\n"
+        "<code>/devip CODE</code> — Retire le statut VIP d'un client\n"
+        "<code>/abonnement CODE</code> — Abonnement VIP illimité 30j\n"
+        "<code>/desabo CODE</code> — Coupe l'abonnement mensuel d'un client\n"
+        "<code>/admin</code> — Affiche ce menu",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@handler_securise
+async def bouton_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    uid = str(user_id)
+
+    with analyses_lock:
+        if uid in analyses_en_cours:
+            deja_en_cours = True
+        else:
+            analyses_en_cours.add(uid)
+            deja_en_cours = False
+
+    if deja_en_cours:
+        await query.answer("⏳ Une analyse est déjà en cours.", show_alert=False)
+        msg = await query.message.reply_text(
+            "⏳ Une analyse est déjà en cours.\n\nPatiente quelques secondes...",
+            parse_mode=ParseMode.HTML,
+        )
+        sauvegarder_message_id(user_id, msg.message_id)
+        return
+
+    try:
+        await query.answer()
+        data, uid = get_ou_creer_user(user_id)
+        user = data[uid]
+
+        expire = appliquer_expiration_si_necessaire(user)
+        normaliser_signaux_restants(user)
+        if expire:
+            sauvegarder_users(data)
+            msg = await remplacer_message(
+                query,
+                texte_expiration(user),
+                bouton_vip() if user.get("restants", 0) <= 0 else bouton_signal(restants=user.get("restants", 0)),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        attente = get_secondes_restantes(user)
+        if attente > 0:
+            msg = await remplacer_message(
+                query,
+                "⏳ <b>Le robot termine l'analyse précédente.</b>\n\n"
+                "Temps restant :\n\n"
+                f"<b>{attente} seconde{'s' if attente > 1 else ''}.</b>",
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        if not peut_obtenir_signal(user):
+            msg = await remplacer_message(
+                query,
+                texte_compteur_compte(user),
+                bouton_vip(),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        await lancer_animation_analyse(query, user_id)
+
+        data, uid = get_ou_creer_user(user_id)
+        user = data[uid]
+        expire = appliquer_expiration_si_necessaire(user)
+        normaliser_signaux_restants(user)
+        if expire:
+            sauvegarder_users(data)
+            msg = await remplacer_message(
+                query,
+                texte_expiration(user),
+                bouton_vip() if user.get("restants", 0) <= 0 else bouton_signal(restants=user.get("restants", 0)),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        if not peut_obtenir_signal(user):
+            msg = await remplacer_message(
+                query,
+                texte_compteur_compte(user),
+                bouton_vip(),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        if not opportunite_marche_disponible(user):
+            msg = await remplacer_message(
+                query,
+                "⚠️ <b>Analyse du marché en cours.</b>\n\n"
+                "Aucune opportunité fiable détectée.\n\n"
+                "Réessaie dans 4 minutes.",
+                bouton_signal(
+                    restants=user.get("restants"),
+                    vip=user.get("vip", False),
+                    illimite=abonnement_actif(user),
+                ),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        signal_txt, signal_genere = generer_signal(user)
+        if not signal_txt:
+            msg = await remplacer_message(
+                query,
+                "⚠️ Impossible de générer une prédiction pour le moment.\n\nRéessaie dans quelques instants.",
+                bouton_signal(
+                    restants=user.get("restants"),
+                    vip=user.get("vip", False),
+                    illimite=abonnement_actif(user),
+                ),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        if not signal_genere:
+            msg = await remplacer_message(
+                query,
+                signal_txt,
+                bouton_signal(
+                    restants=user.get("restants"),
+                    vip=user.get("vip", False),
+                    illimite=abonnement_actif(user),
+                ),
+            )
+            sauvegarder_message_id(user_id, msg.message_id)
+            return
+
+        etat = consommer_signal(user_id, signal_txt=signal_txt)
+        if etat["illimite"]:
+            texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
+            markup = bouton_signal(vip=True, illimite=True)
+        elif etat["mode"] == "vip":
+            restants_apres = etat["restants"]
+            if restants_apres > 0:
+                texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
+                markup = bouton_signal(restants=restants_apres, vip=True)
+            else:
+                texte = (
+                    f"{signal_txt}\n\n"
+                    "⚠️ <b>Dernier signal VIP utilisé.</b>\n"
+                    "💎 Contactez l'administrateur pour recharger votre compte."
+                )
+                markup = bouton_vip()
+        else:
+            restants_apres = etat["restants"]
+            if restants_apres > 0:
+                texte = f"{signal_txt}\n\n{texte_compteur_compte(user)}"
+                markup = bouton_signal(restants=restants_apres)
+            else:
+                texte = (
+                    f"{signal_txt}\n\n"
+                    "❌ Vous avez épuisé vos signaux gratuits.\n\n"
+                    "💎 Contactez l'administrateur pour recharger votre compte."
+                )
+                markup = bouton_vip()
+
+        msg = await remplacer_message(query, texte, markup)
+        sauvegarder_message_id(user_id, msg.message_id)
+    finally:
+        with analyses_lock:
+            analyses_en_cours.discard(uid)
+
+
+@handler_securise
+async def compte_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le sous-menu "Mon compte" """
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    msg = await remplacer_message(
+        query,
+        "👑 <b>MON COMPTE</b>\n\n"
+        "Sélectionne une option :",
+        bouton_compte(),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def vip_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le sous-menu "VIP & Support" """
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    msg = await remplacer_message(
+        query,
+        "💎 <b>ESPACE VIP & SUPPORT</b>\n\n"
+        "Sélectionne une option :",
+        bouton_vip_menu(),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def retour_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retour au menu principal"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    data, uid = get_ou_creer_user(user_id)
+    user = data[uid]
+    restants = user.get("restants", 0)
+    
+    msg = await remplacer_message(
+        query,
+        "🎰 <b>MENU PRINCIPAL</b>\n\nChoisir une action :",
+        bouton_signal(restants=restants, vip=user.get("vip", False), illimite=abonnement_actif(user)),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    
+    msg = await remplacer_message(
+        query,
+        "💎 <b>PACKS VIP</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🥉 <b>Starter</b>\n"
+        "100 signaux → 2 000 FCFA\n\n"
+        "🥈 <b>Standard</b>\n"
+        "250 signaux → 4 000 FCFA\n\n"
+        "🥇 <b>Pro</b>\n"
+        "500 signaux → 7 000 FCFA\n\n"
+        "👑 <b>VIP Mensuel</b>\n"
+        "♾️ Signaux illimités pendant 30 jours\n"
+        "12 000 FCFA\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>💳 Paiement :</b>\n"
+        "Wave / Moov Money\n\n"
+        "<b>📞 Contact Admin</b>\n"
+        f"{admin_username_html()}",
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def historique_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    data, uid = get_ou_creer_user(user_id)
+    historique = data[uid].get("historique_signaux", [])[-4:]
+
+    if not historique:
+        texte = "📊 <b>Derniers signaux</b>\n\nAucun signal enregistré pour le moment."
+    else:
+        lignes = ["📊 <b>Derniers signaux</b>\n"]
+        for entree in reversed(historique):
+            signal = entree.get("signal", "")
+            match = re.search(r"Multiplicateur\*\n`([0-9]+(?:\.[0-9]+)?)x`", signal)
+            if match:
+                lignes.append(f"<code>{echapper_html_texte(match.group(1))}x</code>")
+        texte = "\n\n".join(lignes) if len(lignes) > 1 else "📊 <b>Derniers signaux</b>\n\nAucun signal lisible."
+
+    msg = await remplacer_message(query, texte, bouton_compte())
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def abonnement_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    data, uid = get_ou_creer_user(user_id)
+    user = data[uid]
+    appliquer_expiration_si_necessaire(user)
+    normaliser_signaux_restants(user)
+    sauvegarder_users(data)
+
+    if abonnement_actif(user):
+        texte = (
+            "━━━━━━━━━━━━━━\n"
+            "👑 <b>Mon abonnement</b>\n\n"
+            f"📅 Début\n<b>{echapper_html_texte(formater_date(user.get('vip_debut')))}</b>\n\n"
+            "🎟 Signaux\n<b>♾️ Illimité</b>\n\n"
+            f"📆 Expiration\n<b>{echapper_html_texte(formater_date(user.get('vip_fin')))}</b>\n"
+            "━━━━━━━━━━━━━━"
+        )
+    elif user.get("vip"):
+        texte = (
+            "━━━━━━━━━━━━━━\n"
+            "👑 <b>VIP classique</b>\n\n"
+            "🎟 Signaux restants\n"
+            f"<b>{normaliser_signaux_vip(user)}</b>\n"
+            "━━━━━━━━━━━━━━"
+        )
+    else:
+        texte = (
+            "━━━━━━━━━━━━━━\n"
+            "🆓 <b>Compte gratuit</b>\n\n"
+            "🎟 Signaux restants\n"
+            f"<b>{normaliser_signaux_gratuits(user)}</b>\n"
+            "━━━━━━━━━━━━━━"
+        )
+
+    msg = await remplacer_message(query, texte, bouton_compte())
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le message de support officiel premium"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+
+    msg = await remplacer_message(
+        query,
+        "📞 <b>SUPPORT OFFICIEL</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>Besoin d'aide ?</b>\n\n"
+        "Nous sommes disponibles pour :\n\n"
+        "💳 Recharge de signaux\n"
+        "👑 Activation VIP\n"
+        "♾️ Abonnement mensuel\n"
+        "❓ Questions sur le bot\n"
+        "⚙️ Assistance technique\n"
+        "💰 Problème de paiement\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<b>👤 Contact de l'administrateur</b>\n\n"
+        f"👉 {admin_username_html()}\n\n"
+        "⏰ Réponse généralement en quelques minutes.",
+        bouton_vip_menu(),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def code_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    await query.answer()
+    data, uid = get_ou_creer_user(user_id)
+    
+    msg = await remplacer_message(
+        query,
+        f"ℹ️ <b>Mon code client</b>\n\n<code>{echapper_html_texte(data[uid]['code'])}</code>\n\n"
+        "Ce code te permet de recharger tes signaux auprès de l'admin.",
+        bouton_compte(),
+    )
+    sauvegarder_message_id(user_id, msg.message_id)
+
+
+@handler_securise
+async def effacer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except TelegramError:
+        logger.info("Message déjà supprimé ou inaccessible.")
+
+
+async def verifier_expirations(context: ContextTypes.DEFAULT_TYPE):
+    admin_id = get_admin_id()
+    data = migrer_si_besoin(charger_users())
+    maintenant = datetime.datetime.now()
+    expires = []
+
+    for uid, user in data.items():
+        if not isinstance(user, dict):
+            continue
+        if abonnement_expire(user, maintenant=maintenant):
+            code = user.get("code", "?")
+            date_fin = formater_date(user["vip_fin"])
+            remettre_en_mode_gratuit(user)
+            expires.append((uid, code, date_fin, texte_expiration(user)))
+
+    if expires:
+        sauvegarder_users(data)
+
+    for uid, code, date_fin, message_client in expires:
+        try:
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=message_client,
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            logger.exception("Impossible de notifier le client %s pour l'expiration.", uid)
+
+        if admin_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "⚠️ <b>Abonnement VIP expiré automatiquement !</b>\n\n"
+                        f"🔑 Code client : <code>{echapper_html_texte(code)}</code>\n"
+                        f"📆 Date d'expiration : <b>{echapper_html_texte(date_fin)}</b>\n\n"
+                        "Le statut VIP et l'accès illimité ont été retirés."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                logger.exception("Impossible de notifier l'admin pour l'expiration %s.", code)
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot en ligne")
+
+    def log_message(self, format, *args):
+        return
+
+
+def lancer_serveur():
+    port = int(os.environ.get("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info("Serveur de santé démarré sur le port %s.", port)
+    server.serve_forever()
+
+
+async def supprimer_webhook(application: Application):
+    await application.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Webhook supprimé. Démarrage du polling.")
+
+
+def creer_application():
+    if not TOKEN:
+        raise RuntimeError("La variable d'environnement BOT_TOKEN est obligatoire.")
+    
+    app = ApplicationBuilder().token(TOKEN).post_init(supprimer_webhook).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clean", clean))
+    app.add_handler(CommandHandler("moncode", mon_code))
+    app.add_handler(CommandHandler("recharge", recharger))
+    app.add_handler(CommandHandler("clients", clients))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("vip", activer_vip_cmd))
+    app.add_handler(CommandHandler("abonnement", abonnement_cmd))
+    app.add_handler(CommandHandler("devip", desactiver_vip_cmd))
+    app.add_handler(CommandHandler("desabo", desabonner_cmd))
+    app.add_handler(CommandHandler("admin", admin_help))
+    
+    # Handlers de callback - Menu principal
+    app.add_handler(CallbackQueryHandler(bouton_callback, pattern="^signal$"))
+    app.add_handler(CallbackQueryHandler(compte_menu_callback, pattern="^compte_menu$"))
+    app.add_handler(CallbackQueryHandler(vip_menu_callback, pattern="^vip_menu$"))
+    app.add_handler(CallbackQueryHandler(retour_callback, pattern="^retour$"))
+    
+    # Handlers de callback - Sous-menus
+    app.add_handler(CallbackQueryHandler(vip_callback, pattern="^vip$"))
+    app.add_handler(CallbackQueryHandler(historique_callback, pattern="^historique$"))
+    app.add_handler(CallbackQueryHandler(abonnement_callback, pattern="^abonnement$"))
+    app.add_handler(CallbackQueryHandler(support_callback, pattern="^support$"))
+    app.add_handler(CallbackQueryHandler(code_callback, pattern="^code$"))
+    app.add_handler(CallbackQueryHandler(effacer_callback, pattern="^effacer$"))
+    
+    app.add_error_handler(error_handler)
+
+    if app.job_queue:
+        app.job_queue.run_repeating(verifier_expirations, interval=86400, first=60)
+    else:
+        logger.warning("Job queue indisponible. Vérifie python-telegram-bot[job-queue] dans requirements.txt.")
+
+    return app
+
+
 def main():
-    """Fonction principale pour démarrer le bot"""
-    initialiser_db()
-
-    # Créer l'application
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    # Ajouter les handlers de commandes
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("clean", clean))
-    application.add_handler(CommandHandler("code", mon_code))
-    application.add_handler(CommandHandler("recharge", recharger))
-    application.add_handler(CommandHandler("clients", clients))
-    application.add_handler(CommandHandler("vip", activer_vip_cmd))
-    application.add_handler(CommandHandler("abonnement", abonnement_cmd))
-    application.add_handler(CommandHandler("devip", desactiver_vip_cmd))
-    application.add_handler(CommandHandler("dashboard", dashboard))
-
-    # Ajouter le handler de callbacks
-    application.add_handler(CallbackQueryHandler(callback_handler))
-
-    # Ajouter le handler d'erreur
-    application.add_error_handler(error_handler)
-
-    # Démarrer le bot
-    application.run_polling()
+    threading.Thread(target=lancer_serveur, daemon=True).start()
+    app = creer_application()
+    logger.info("Bot démarré.")
+    app.run_polling(
+        poll_interval=1.0,
+        timeout=30,
+        bootstrap_retries=-1,
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
